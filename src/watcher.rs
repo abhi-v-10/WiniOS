@@ -2,11 +2,15 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+};
 use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 use windows::Win32::System::DataExchange::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -16,10 +20,14 @@ use crate::clipboard::{
     ClipboardState, ClipboardStore, MAX_TEXT_BYTES, Observation, ReadValue, TextError,
     UnavailableReason, Update, decode_text,
 };
+use crate::writes::{WriteCommand, WriteError, WriteReceipt, validate_text};
+use tokio::sync::mpsc;
 
 const CF_UNICODETEXT: u32 = 13; // Standard Win32 clipboard format.
 const RETRY_TIMER: usize = 1;
 const SHUTDOWN: u32 = WM_APP + 1;
+const WRITE_COMMAND: u32 = WM_APP + 2;
+const WRITE_TIMER: usize = 2;
 const BACKOFF_MS: [u32; 6] = [20, 40, 80, 160, 320, 640];
 static MESSAGE_THREAD: AtomicU32 = AtomicU32::new(0);
 
@@ -111,6 +119,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         unsafe {
             self.cancel_retry();
+            let _ = KillTimer(Some(self.hwnd), WRITE_TIMER);
             if self.listening {
                 let _ = RemoveClipboardFormatListener(self.hwnd);
             }
@@ -290,13 +299,8 @@ impl Capture {
                     snapshot.origin,
                     snapshot.operation_id.observation,
                 );
-                if self.debug {
-                    if let ClipboardState::Available(text) = snapshot.state {
-                        eprintln!("clipboard text: {:?}", text.text);
-                    }
-                }
             }
-            Ok(Update::Duplicate | Update::Superseded) => {}
+            Ok(Update::Duplicate | Update::Superseded | Update::Remote) => {}
             Err(error) => eprintln!("Skipped clipboard: {error}"),
         }
     }
@@ -358,6 +362,13 @@ impl Capture {
 
     fn notification(&mut self, window: &Window) -> Result<()> {
         let current = sequence();
+        // Only suppress our own accepted write, identified by sequence AND
+        // owner, never by a lasting text comparison. Future local copies win.
+        if self.store.is_remote_sequence(current)
+            && unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == window.hwnd)
+        {
+            return Ok(());
+        }
         // Repeated notifications must not reset a pending version's retry budget.
         // Re-read settled observations even at the same sequence: the native
         // number is a change hint, not a unique or globally ordered operation ID.
@@ -379,16 +390,216 @@ pub fn request_shutdown() -> Result<()> {
     Ok(())
 }
 
-pub fn run(store: ClipboardStore, debug: bool, ready: impl FnOnce()) -> Result<()> {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writes::{QUEUE_CAPACITY, WriteClient};
+
+    #[tokio::test]
+    async fn shutdown_fails_active_and_queued_requests_without_native_access() {
+        let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let client = WriteClient::new(sender, || true);
+        let mut pump = WritePump {
+            receiver,
+            active: None,
+            deadline: None,
+        };
+        let active = tokio::spawn({
+            let client = client.clone();
+            async move { client.write("disposable active".into()).await }
+        });
+        let command = pump.receiver.recv().await.unwrap();
+        pump.active = Some(PendingWrite {
+            command,
+            retries: 0,
+        });
+        let queued = tokio::spawn(async move { client.write("disposable queued".into()).await });
+        tokio::task::yield_now().await;
+        assert_eq!(pump.receiver.len(), 1);
+        drop(pump);
+        assert!(matches!(
+            active.await.unwrap(),
+            Err(WriteError::Unavailable)
+        ));
+        assert!(matches!(
+            queued.await.unwrap(),
+            Err(WriteError::Unavailable)
+        ));
+    }
+}
+
+pub fn wake_writes() -> bool {
+    let thread = MESSAGE_THREAD.load(Ordering::SeqCst);
+    thread != 0
+        && unsafe { PostThreadMessageW(thread, WRITE_COMMAND, WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
+struct OwnedGlobal(Option<HGLOBAL>);
+impl Drop for OwnedGlobal {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0 {
+            unsafe {
+                let _ = GlobalFree(Some(handle));
+            }
+        }
+    }
+}
+
+/// Runs exclusively on the window's message thread. Allocation/locking happens
+/// before EmptyClipboard, so preparation failures never destroy old data.
+fn write_text(
+    window: &Window,
+    capture: &mut Capture,
+    command: &WriteCommand,
+) -> std::result::Result<WriteReceipt, WriteError> {
+    validate_text(&command.text)?;
+    let units: Vec<u16> = command.text.encode_utf16().chain([0]).collect();
+    unsafe {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2).map_err(|_| WriteError::Failed)?;
+        let mut allocation = OwnedGlobal(Some(handle));
+        let pointer = GlobalLock(handle);
+        if pointer.is_null() {
+            return Err(WriteError::Failed);
+        }
+        {
+            let _lock = LockedGlobal(handle);
+            std::ptr::copy_nonoverlapping(units.as_ptr(), pointer.cast::<u16>(), units.len());
+        }
+        OpenClipboard(Some(window.hwnd)).map_err(|_| WriteError::Busy)?;
+        let clipboard = OpenClipboardGuard;
+        // Last cancellable point before the native commit. Timeouts after this
+        // point cannot undo an accepted SetClipboardData operation.
+        if command.expired() {
+            return Err(WriteError::Timeout);
+        }
+        window.cancel_retry();
+        capture.deadline = None;
+        capture.restart(sequence());
+        if EmptyClipboard().is_err() {
+            capture.publish(ReadValue::Unavailable(UnavailableReason::WriteFailed));
+            return Err(WriteError::Failed);
+        }
+        if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))).is_err() {
+            capture.publish(ReadValue::Unavailable(UnavailableReason::WriteFailed));
+            return Err(WriteError::Failed);
+        }
+        // Windows owns it now. Never free it, even if later bookkeeping fails.
+        allocation.0 = None;
+        let accepted_sequence = sequence();
+        drop(clipboard);
+        let current = sequence();
+        let still_owner = GetClipboardOwner().is_ok_and(|owner| owner == window.hwnd);
+        let observed = if still_owner {
+            current
+        } else {
+            accepted_sequence
+        };
+        capture.observation = capture.store.begin_remote_observation(observed);
+        let _ = capture.store.complete(
+            &mut capture.observation,
+            ReadValue::Text(command.text.clone()),
+        );
+        let operation = capture.store.snapshot().operation_id.observation;
+        if !still_owner {
+            // Another application replaced it after acceptance. Never label
+            // that newer sequence with our text or suppress its notification.
+            capture.restart(current);
+        }
+        Ok(WriteReceipt {
+            operation,
+            sequence: observed,
+        })
+    }
+}
+
+struct PendingWrite {
+    command: WriteCommand,
+    retries: usize,
+}
+struct WritePump {
+    receiver: mpsc::Receiver<WriteCommand>,
+    active: Option<PendingWrite>,
+    deadline: Option<Instant>,
+}
+impl Drop for WritePump {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Some(active) = self.active.take() {
+            let _ = active.command.ack.send(Err(WriteError::Unavailable));
+        }
+        while let Ok(command) = self.receiver.try_recv() {
+            let _ = command.ack.send(Err(WriteError::Unavailable));
+        }
+    }
+}
+impl WritePump {
+    fn step(&mut self, window: &Window, capture: &mut Capture) -> Result<()> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Ok(());
+        }
+        unsafe {
+            let _ = KillTimer(Some(window.hwnd), WRITE_TIMER);
+        }
+        self.deadline = None;
+        let mut pending = match self.active.take() {
+            Some(active) => active,
+            None => match self.receiver.try_recv() {
+                Ok(command) => PendingWrite {
+                    command,
+                    retries: 0,
+                },
+                Err(_) => return Ok(()),
+            },
+        };
+        let result = if pending.command.expired() {
+            Err(WriteError::Timeout)
+        } else {
+            write_text(window, capture, &pending.command)
+        };
+        if matches!(result, Err(WriteError::Busy)) && !pending.command.expired() {
+            if let Some(&delay) = BACKOFF_MS.get(pending.retries) {
+                if unsafe { SetTimer(Some(window.hwnd), WRITE_TIMER, delay, None) } == 0 {
+                    let _ = pending.command.ack.send(Err(WriteError::Unavailable));
+                    return Err(Error::from_thread());
+                }
+                self.deadline = Some(Instant::now() + Duration::from_millis(delay.into()));
+                pending.retries += 1;
+                self.active = Some(pending);
+                return Ok(());
+            }
+        }
+        let _ = pending.command.ack.send(result);
+        // Fairness: at most one write attempt per dispatched message.
+        if !self.receiver.is_empty() {
+            let _ = wake_writes();
+        }
+        Ok(())
+    }
+}
+
+pub fn run(
+    store: ClipboardStore,
+    debug: bool,
+    writes: mpsc::Receiver<WriteCommand>,
+    ready: impl FnOnce(),
+) -> Result<()> {
     let window = Window::new()?;
     let console = ConsoleHandler::new()?;
     println!("WiniOS clipboard watcher started. Press Ctrl+C to stop.");
     if debug {
-        eprintln!("WARNING: clipboard content logging enabled.");
+        eprintln!("Clipboard diagnostics enabled (metadata only; no text or request bodies).");
     }
     // Register BEFORE observing startup state. Changes during this read remain
     // queued; matching sequence notifications are harmless.
     let mut capture = Capture::new(store, debug);
+    let mut writer = WritePump {
+        receiver: writes,
+        active: None,
+        deadline: None,
+    };
     capture.attempt(&window)?;
     ready();
     let mut msg = MSG::default();
@@ -403,7 +614,11 @@ pub fn run(store: ClipboardStore, debug: bool, ready: impl FnOnce()) -> Result<(
         let update = msg.hwnd == window.hwnd && msg.message == WM_CLIPBOARDUPDATE;
         let timer =
             msg.hwnd == window.hwnd && msg.message == WM_TIMER && msg.wParam.0 == RETRY_TIMER;
-        if update {
+        let write_timer =
+            msg.hwnd == window.hwnd && msg.message == WM_TIMER && msg.wParam.0 == WRITE_TIMER;
+        if msg.message == WRITE_COMMAND || write_timer {
+            writer.step(&window, &mut capture)?;
+        } else if update {
             capture.notification(&window)?;
         } else if timer {
             // KillTimer does not purge queued WM_TIMER messages. Ignore early
@@ -421,6 +636,7 @@ pub fn run(store: ClipboardStore, debug: bool, ready: impl FnOnce()) -> Result<(
             }
         }
     }
+    drop(writer);
     drop(capture);
     drop(console);
     drop(window);

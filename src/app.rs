@@ -4,6 +4,7 @@ use crate::{
     http::{self, ApiState},
     native::{self, AppError, SingleInstance},
     watcher,
+    writes::{QUEUE_CAPACITY, WriteClient},
 };
 use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::oneshot};
@@ -21,10 +22,15 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let store = ClipboardStore::default();
+    let (write_sender, write_receiver) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+    let writes = config
+        .allow_write
+        .then(|| WriteClient::new(write_sender, watcher::wake_writes));
     let app = http::router(ApiState {
         store: store.clone(),
         token,
         sequence: watcher::sequence,
+        writes,
     });
     let (ready_tx, ready_rx) = oneshot::channel();
     let (done_tx, mut done_rx) = oneshot::channel();
@@ -32,7 +38,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         .name("winios-clipboard".into())
         .spawn(move || {
             let status_store = store.clone();
-            let result = watcher::run(store, config.debug, || {
+            let result = watcher::run(store, config.debug, write_receiver, || {
                 let _ = ready_tx.send(());
             })
             .map_err(|error| error.to_string());
@@ -69,6 +75,9 @@ pub async fn run(config: Config) -> Result<(), AppError> {
     println!(
         "WARNING: HTTP is unencrypted. Disposable, non-sensitive text on trusted Wi-Fi only; never port-forward this service."
     );
+    if config.allow_write {
+        println!("Development POST /v1/clipboard is ENABLED. Disposable text only.");
+    }
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let server = axum::serve(
         listener,

@@ -53,6 +53,7 @@ pub struct SessionId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     WindowsClipboard,
+    Iphone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ pub enum UnavailableReason {
     SequenceUnknown,
     ChangedDuringRead,
     WatcherStopped,
+    WriteFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +137,7 @@ pub enum Update {
     Changed,
     Duplicate,
     Superseded,
+    Remote,
 }
 
 impl Default for ClipboardStore {
@@ -184,6 +187,22 @@ impl ClipboardStore {
     /// Invalidate before accessing Win32, including the initial startup read.
     /// Sequence numbers are equality-only tokens: never numerically ordered.
     pub fn begin_observation(&self, sequence: Option<u32>) -> Observation {
+        self.begin_with_origin(sequence, Origin::WindowsClipboard)
+    }
+
+    pub fn begin_remote_observation(&self, sequence: Option<u32>) -> Observation {
+        self.begin_with_origin(sequence, Origin::Iphone)
+    }
+
+    pub fn is_remote_sequence(&self, sequence: Option<u32>) -> bool {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        sequence.is_some()
+            && inner.snapshot.sequence == sequence
+            && inner.snapshot.origin == Origin::Iphone
+            && matches!(inner.snapshot.state, ClipboardState::Available(_))
+    }
+
+    fn begin_with_origin(&self, sequence: Option<u32>, origin: Origin) -> Observation {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         let snapshot = &mut inner.snapshot;
         snapshot.state = ClipboardState::Unavailable(UnavailableReason::Pending);
@@ -191,6 +210,7 @@ impl ClipboardStore {
         snapshot.operation_id.observation += 1;
         snapshot.updated_at = SystemTime::now();
         snapshot.sequence = sequence;
+        snapshot.origin = origin;
         Observation {
             operation_id: snapshot.operation_id,
             sequence,
@@ -233,6 +253,11 @@ impl ClipboardStore {
             _ => snapshot.state == state,
         };
         match &state {
+            ClipboardState::Available(_) if snapshot.origin == Origin::Iphone => {
+                // Remote writes must not become outgoing local changes, nor
+                // suppress a later deliberate local copy of the same text.
+                *last_successful_text = None;
+            }
             ClipboardState::Available(text) => {
                 if !duplicate {
                     *last_successful_text = Some(text.text.clone());
@@ -257,17 +282,53 @@ impl ClipboardStore {
         if let Some(error) = validation_error {
             return Err(error);
         }
-        Ok(if duplicate {
-            Update::Duplicate
-        } else {
-            Update::Changed
-        })
+        Ok(
+            if snapshot.origin == Origin::Iphone
+                && matches!(snapshot.state, ClipboardState::Available(_))
+            {
+                Update::Remote
+            } else if duplicate {
+                Update::Duplicate
+            } else {
+                Update::Changed
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_operations_are_not_outgoing_and_do_not_hide_later_local_copy() {
+        let store = ClipboardStore::default();
+        text(&store, 1, "same");
+        let mut stale_local = store.begin_observation(Some(2));
+        let mut remote = store.begin_remote_observation(Some(3));
+        assert_eq!(
+            store
+                .complete(&mut remote, ReadValue::Text("same".into()))
+                .unwrap(),
+            Update::Remote
+        );
+        let accepted = store.snapshot();
+        assert_eq!(accepted.origin, Origin::Iphone);
+        assert_eq!(accepted.sequence, Some(3));
+        assert!(store.is_remote_sequence(Some(3)));
+        assert!(!store.is_remote_sequence(Some(4)));
+        assert_eq!(
+            store
+                .complete(&mut stale_local, ReadValue::Text("stale".into()))
+                .unwrap(),
+            Update::Superseded
+        );
+        assert_eq!(store.snapshot().operation_id, accepted.operation_id);
+        assert_eq!(text(&store, 4, "same"), Update::Changed);
+        assert_eq!(store.snapshot().origin, Origin::WindowsClipboard);
+        assert_ne!(store.snapshot().operation_id, accepted.operation_id);
+        assert_eq!(text(&store, 5, "same"), Update::Duplicate);
+    }
 
     fn publish(store: &ClipboardStore, seq: u32, value: ReadValue) -> Result<Update, TextError> {
         let mut observation = store.begin_observation(Some(seq));

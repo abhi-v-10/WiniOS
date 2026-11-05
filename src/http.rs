@@ -1,11 +1,12 @@
 use crate::{
     auth::BearerToken,
     clipboard::{ClipboardState, ClipboardStore, MAX_TEXT_BYTES},
+    writes::{MAX_JSON_BYTES, WriteClient, WriteError, WriteReceipt},
 };
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -22,12 +23,18 @@ pub struct ApiState {
     pub token: Arc<BearerToken>,
     /// Production uses GetClipboardSequenceNumber; tests inject a deterministic source.
     pub sequence: fn() -> Option<u32>,
+    pub writes: Option<WriteClient>,
 }
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
-        .route("/v1/clipboard", get(clipboard))
+        .route(
+            "/v1/clipboard",
+            get(clipboard)
+                .post(write_clipboard)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BYTES)),
+        )
         .with_state(state)
         .layer(middleware::from_fn(local_only))
 }
@@ -104,12 +111,286 @@ async fn clipboard(State(state): State<ApiState>, headers: HeaderMap) -> Respons
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WritePayload {
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct WriteResponse {
+    status: &'static str,
+    #[serde(flatten)]
+    receipt: WriteReceipt,
+}
+
+async fn write_clipboard(State(state): State<ApiState>, request: Request) -> Response {
+    // Authenticate before reading/deserializing the body. Rejection messages
+    // are deliberately discarded: serde diagnostics can include user input.
+    if !state.token.authorizes(request.headers()) {
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"winios\""),
+        );
+        return response;
+    }
+    let Some(writer) = &state.writes else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let payload = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Json::<WritePayload>::from_request(request, &state),
+    )
+    .await
+    {
+        Ok(Ok(Json(payload))) => payload,
+        Ok(Err(rejection)) => return rejection.status().into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    match writer.write(payload.text).await {
+        Ok(receipt) => Json(WriteResponse {
+            status: "ok",
+            receipt,
+        })
+        .into_response(),
+        Err(error) => match error {
+            WriteError::Invalid => StatusCode::UNPROCESSABLE_ENTITY,
+            WriteError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            WriteError::Busy | WriteError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            WriteError::Failed => StatusCode::INTERNAL_SERVER_ERROR,
+            WriteError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        }
+        .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clipboard::{ReadValue, UnavailableReason};
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
+
+    fn write_app(
+        enabled: bool,
+    ) -> (
+        Router,
+        tokio::sync::mpsc::Receiver<crate::writes::WriteCommand>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(crate::writes::QUEUE_CAPACITY);
+        (
+            router(ApiState {
+                store: ClipboardStore::default(),
+                token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
+                sequence: || Some(7),
+                writes: enabled.then(|| WriteClient::new(sender, || true)),
+            }),
+            receiver,
+        )
+    }
+
+    async fn post(
+        app: Router,
+        auth: Option<&str>,
+        content_type: Option<&str>,
+        body: String,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/clipboard")
+            .extension(ConnectInfo(
+                "192.168.1.25:12345".parse::<SocketAddr>().unwrap(),
+            ));
+        if let Some(auth) = auth {
+            request = request.header(header::AUTHORIZATION, auth);
+        }
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        app.oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_auth_and_feature_gate_precede_body_parsing() {
+        let (app, mut receiver) = write_app(true);
+        for auth in [None, Some("Bearer wrong")] {
+            assert_eq!(
+                post(app.clone(), auth, None, "not JSON".into())
+                    .await
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        let (disabled, _) = write_app(false);
+        assert_eq!(
+            post(
+                disabled,
+                Some(&bearer()),
+                Some("application/json"),
+                r#"{"text":"disposable"}"#.into()
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn post_validates_json_content_type_text_and_bounded_body() {
+        let (app, mut receiver) = write_app(true);
+        for (ct, body, expected) in [
+            (
+                None,
+                r#"{"text":"disposable"}"#.into(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Some("text/plain"),
+                "disposable".into(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Some("application/json"),
+                "{".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Some("application/json"),
+                r#"{"text":7}"#.into(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Some("application/json"),
+                r#"{}"#.into(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Some("application/json"),
+                r#"{"text":"a\u0000b"}"#.into(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Some("application/json"),
+                r#"{"text":"x","extra":true}"#.into(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                Some("application/json"),
+                format!("{{\"text\":\"{}\"}}", "a".repeat(MAX_TEXT_BYTES + 1)),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                Some("application/json"),
+                " ".repeat(MAX_JSON_BYTES + 1),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = post(app.clone(), Some(&bearer()), ct, body).await;
+            assert_eq!(response.status(), expected);
+            assert!(
+                to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn post_only_succeeds_after_ack_and_maps_worker_errors() {
+        let (app, mut receiver) = write_app(true);
+        let request_app = app.clone();
+        let request = tokio::spawn(async move {
+            post(
+                request_app,
+                Some(&bearer()),
+                Some("application/json"),
+                r#"{"text":"disposable 😀"}"#.into(),
+            )
+            .await
+        });
+        let command = receiver.recv().await.unwrap();
+        assert_eq!(command.text, "disposable 😀");
+        assert!(!request.is_finished());
+        command
+            .ack
+            .send(Ok(WriteReceipt {
+                operation: 12,
+                sequence: Some(8),
+            }))
+            .ok();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+            br#"{"status":"ok","operation":12,"sequence":8}"#
+        );
+        for (error, status) in [
+            (WriteError::Busy, StatusCode::SERVICE_UNAVAILABLE),
+            (WriteError::Failed, StatusCode::INTERNAL_SERVER_ERROR),
+            (WriteError::Timeout, StatusCode::GATEWAY_TIMEOUT),
+            (WriteError::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let app = app.clone();
+            let request = tokio::spawn(async move {
+                post(
+                    app,
+                    Some(&bearer()),
+                    Some("application/json"),
+                    r#"{"text":"disposable"}"#.into(),
+                )
+                .await
+            });
+            receiver.recv().await.unwrap().ack.send(Err(error)).ok();
+            assert_eq!(request.await.unwrap().status(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_tcp_post_round_trip_through_axum_and_command_ack() {
+        use std::io::{Read, Write};
+        let (app, mut receiver) = write_app(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let worker = tokio::spawn(async move {
+            let command = receiver.recv().await.unwrap();
+            assert_eq!(command.text, "disposable wire test");
+            command
+                .ack
+                .send(Ok(WriteReceipt {
+                    operation: 19,
+                    sequence: Some(20),
+                }))
+                .ok();
+        });
+        let response = tokio::task::spawn_blocking(move || {
+            let mut stream = std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3)).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let body = r#"{"text":"disposable wire test"}"#;
+            write!(stream, "POST /v1/clipboard HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        }).await.unwrap();
+        worker.await.unwrap();
+        server.abort();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"operation\":19"));
+        assert!(!response.contains("disposable wire test"));
+    }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     fn app(value: ReadValue, observed: Option<u32>, sequence: fn() -> Option<u32>) -> Router {
@@ -120,6 +401,7 @@ mod tests {
             store,
             token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
             sequence,
+            writes: None,
         })
     }
     async fn call(app: Router, auth: Option<&str>, path: &str) -> Response {
@@ -154,6 +436,7 @@ mod tests {
             store: store.clone(),
             token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
             sequence: || Some(8),
+            writes: None,
         });
         for reason in [
             UnavailableReason::Pending,
@@ -216,6 +499,7 @@ mod tests {
             store,
             token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
             sequence: || Some(7),
+            writes: None,
         });
         let response = call(router, Some(&bearer()), "/v1/clipboard").await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);

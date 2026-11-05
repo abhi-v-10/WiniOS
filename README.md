@@ -1,8 +1,8 @@
-# WiniOS agent — Mission 002
+# WiniOS agent — Mission 003
 
 A Windows clipboard watcher using Win32, with a minimal Axum/Tokio HTTP API for
-Windows → iPhone clipboard transfer. No clipboard writer, frontend, cloud service,
-or periodic clipboard polling is included.
+bidirectional Windows ↔ iPhone text transfer. POST writes are disabled by default.
+No frontend, cloud service, Bluetooth, or periodic clipboard polling is included.
 
 **Bearer-authenticated HTTP is not encrypted.** This prototype is only for
 disposable, non-sensitive text on a trusted LAN. Anyone able to inspect the HTTP
@@ -96,6 +96,104 @@ baseline is never part of a response. A clipboard change *after* this final chec
 cannot retract bytes already handed to the network; the API is a point-in-time
 transfer, not a lock held through transmission.
 
+## Development-only iPhone → Windows writes
+
+Enable POST explicitly on your assigned private LAN address:
+
+```powershell
+cargo run -- --lan 192.168.1.42 --port 8765 --allow-insecure-clipboard-write
+```
+
+The write flag is rejected without explicit private `--lan` binding. It cannot be
+combined with the legacy diagnostic flag. Without it, authenticated POST requests
+get 403; GET continues working as before. No firewall rules are changed.
+Plaintext HTTP exposes both credentials and submitted text, and anyone holding
+the token can replace your Windows clipboard while POST is enabled. Use only
+disposable test text. HTTPS or another authenticated encrypted channel is required
+before everyday use. Do not port-forward, tunnel, or proxy this endpoint publicly.
+
+Send `POST /v1/clipboard` with `Content-Type: application/json`, the existing
+`Authorization: Bearer <token>` header, and a JSON object such as:
+
+```json
+{"text":"Hello from iPhone"}
+```
+
+Only the `text` string field is accepted. Text must be valid Unicode with no
+embedded NUL. Empty strings and newline characters are supported; LF/CRLF and
+Unicode are preserved exactly. Both the UTF-8 payload and UTF-16 source retain
+the existing 1 MiB limits (thus ASCII is capped at 524,288 characters by UTF-16).
+Before JSON deserialization, the HTTP body is capped at 6 MiB + 64 bytes, allowing
+JSON escape expansion of valid text. Body upload/read is limited to five seconds.
+Unauthorized/disabled requests are rejected before reading the body, and parser
+diagnostic bodies are discarded so input cannot leak through error responses.
+
+| POST outcome | Status |
+| --- | --- |
+| Windows accepted `SetClipboardData` | 200, JSON `{"status":"ok","operation":N,"sequence":S}` |
+| Missing/incorrect bearer | 401 |
+| Writes disabled or peer disallowed | 403 |
+| Malformed JSON | 400 |
+| Incorrect content type | 415 |
+| Invalid/missing text field, extra fields, embedded NUL | 422 |
+| Text or encoded HTTP body too large | 413 |
+| Body read deadline reached | 408 |
+| Queue full, worker stopped, or contention retries exhausted | 503 |
+| Native allocation/clipboard commit failed | 500 |
+| Write acknowledgement deadline reached | 504 |
+
+HTTP handlers send owned Rust strings through a four-slot Tokio command channel;
+one additional command can be active. A posted Win32 message wakes the existing
+message thread. Only that thread allocates moveable global memory, copies
+NUL-terminated UTF-16, opens/empties the clipboard, and calls `SetClipboardData`.
+Failed writes free their allocations; successful ownership transfer disarms the
+free guard. See [Microsoft's ownership contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata).
+
+Clipboard contention uses a separate Win32 timer with the same six bounded
+backoffs (20–640 ms); there are no sleeps in the message loop. Each queued command
+expires after three seconds including queue time. Expired/disconnected commands
+are checked again immediately before the destructive native commit and skipped.
+An acknowledgement is sent only after Windows accepts ownership. **A 504 or a
+lost connection is not proof that no write occurred:** if the native commit was
+already underway, it cannot be undone safely. Inspect the clipboard before
+retrying an uncertain operation; there is no durable idempotency/replay protocol.
+If `EmptyClipboard` succeeds and `SetClipboardData` subsequently fails, previous
+formats may already be lost; the store is invalidated and no success is returned.
+
+Accepted writes have `Iphone` origin (meaning an authenticated API write, not
+verified device identity) and a process-session operation ID. Their own matching
+sequence/owner notifications are suppressed and produce `Update::Remote`, not an
+outgoing local-change event. GET can still read the accepted text. A later local
+copy—even the same text—gets `WindowsClipboard` origin and a new local update.
+No automatic forwarding or background bidirectional sync is implemented.
+
+Shutdown closes the command receiver and fails active/queued requests. Already
+accepted commits remain valid; queued commands are not replayed after restart.
+
+### iPhone “Send to Windows” Shortcut
+
+1. Enable the development flag above and connect both devices to trusted Wi-Fi.
+2. Add **Get Clipboard** as the first action in a new Shortcut.
+3. Add **URL** using `http://<printed-PC-IP>:8765/v1/clipboard`.
+4. Add **Get Contents of URL**, select **POST**, and set the header
+   **Authorization** to **Bearer <your existing token>**. Do not put it in the URL.
+5. Set **Request Body** to **JSON**. Add a **Text** field named `text` and select
+   the magic variable from **Get Clipboard** as its value. Let Shortcuts encode
+   the JSON; do not manually interpolate clipboard text into a JSON string.
+   Shortcuts should set `Content-Type: application/json` for the JSON body.
+6. Read the response dictionary's `status` field. Only if it equals `ok`, show
+   **Show Notification** → “Sent to Windows”. On errors, stop/show a failure
+   notification; never show success unconditionally.
+7. Copy disposable text on iPhone, run the Shortcut, then Ctrl+V into Notepad.
+   Repeat with emoji, accents, and multiple lines. Run the existing GET Shortcut
+   afterward to verify Windows → iPhone still works.
+
+For 403, restart with both required flags; for 415, select JSON request body;
+for 422, ensure `text` is a string rather than a list/image/URL object. For 503,
+close clipboard tools temporarily and retry once contention settles. For 504,
+check what was actually pasted before retrying. The Windows clipboard may change
+again immediately after acceptance if another application copies something.
+
 ## Apple Shortcuts setup
 
 1. Connect the iPhone and PC to the same trusted Wi-Fi. Start the agent with
@@ -148,17 +246,18 @@ the selected address is not assigned locally or the port is occupied.
 
 Keep the terminal running. Initial and new Unicode text produce a local timestamp
 and a Unicode scalar-value count (an emoji sequence can contain multiple characters).
-Clipboard contents are never printed by default. Stop with **Ctrl+C**; expect
+Clipboard contents are never printed. Stop with **Ctrl+C**; expect
 `WiniOS clipboard watcher stopped.` and the terminal prompt to return.
 
-Explicit, sensitive-content debugging:
+Optional metadata-only diagnostics (read-only mode):
 
 ```powershell
 cargo run -- --debug-clipboard
 ```
 
-Debug output quotes/escapes text, including terminal control characters. Do not
-enable this while copying secrets.
+The legacy flag name is retained, but content logging has been removed. It only
+enables access-error diagnostics. Text, request bodies, and bearer tokens are never
+included in service logs; explicit `--show-token` remains a separate secret-export command.
 
 ## Design and limits
 
@@ -229,7 +328,7 @@ the observed Windows `sequence` (or `None` for zero/unknown), `origin`, and an
 with a local observation counter. One observation keeps its operation ID across
 retries; each published state transition advances the snapshot version. IDs are
 process-session scoped design hooks, not durable device IDs or a sync wire protocol.
-Only `WindowsClipboard` origin exists; no Windows clipboard writer is implemented.
+Local observations use `WindowsClipboard` origin; accepted API writes use `Iphone`.
 
 Windows sequence numbers are compared for equality, never numerical ordering.
 They are checked before reading, while the clipboard is still open after reading,
@@ -262,6 +361,28 @@ empty/unavailable states, retained-baseline non-disclosure, stale/unknown sequen
 rejection, health, and public-peer refusal. Tests use disposable in-memory text
 and injected sequence values; they do not start another Windows watcher or write
 to the real clipboard. The native RNG test does not persist test credentials.
+POST tests cover the feature gate, authentication before parsing, content types,
+JSON/schema/text validation, bounded bodies, acknowledgement ordering, worker
+failures/timeouts, cancellation, bounded queues, and operation-origin behavior.
+One TCP integration test uses an in-process test command consumer rather than
+the real clipboard. It does not assert native Win32 success.
+
+For an explicit **real Windows API integration test**, first run one agent with
+both LAN/write flags, then execute this in a second PowerShell terminal as the
+same Windows user:
+
+```powershell
+.\scripts\Test-ClipboardPost.ps1 -BaseUri http://192.168.1.42:8765
+```
+
+This intentionally replaces the Windows clipboard with disposable test data. It
+loads the existing credential without printing it, verifies exact native Unicode
+and mixed-newline readback, GET compatibility, repeated operations, recovery from
+500 ms contention, rejection after 1.8 s contention, and a later deliberate local
+copy. It prints only pass/failure status, never text or credentials. In the agent
+log, the remote writes must not emit local `clipboard updated` events; the final
+deliberate local copy should emit one. Avoid copying other text during the test.
+It starts no additional agent and changes no firewall settings.
 
 ## Manual end-to-end test
 
@@ -317,8 +438,8 @@ require manual validation; automated handler tests cannot establish those.
    **This modifies the clipboard; use disposable test data.**
 7. Press Ctrl+C in the watcher terminal. Confirm the stopped message, prompt
    return, and successful restart. Repeat with Ctrl+Break if available.
-8. Optionally run with `--debug-clipboard` using disposable text and confirm
-   content is printed only in this mode.
+8. Optionally run read-only mode with `--debug-clipboard` and confirm that only
+   metadata/access errors are logged, never clipboard contents.
 9. With a native test helper, publish unterminated/invalid UTF-16 test data.
    Expect `MalformedData` and no readable text. Then copy a valid value to recover.
 

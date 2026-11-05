@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt", "net", "sync", "time"] }
 subtle = "2.6"
 

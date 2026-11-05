@@ -5,6 +5,7 @@ pub struct Config {
     pub debug: bool,
     pub show_token: bool,
     pub help: bool,
+    pub allow_write: bool,
 }
 impl Config {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, &'static str> {
@@ -13,6 +14,7 @@ impl Config {
         let mut debug = false;
         let mut show_token = false;
         let mut help = false;
+        let mut allow_write = false;
         let mut lan = false;
         let mut port_set = false;
         let mut args = args.into_iter();
@@ -41,19 +43,27 @@ impl Config {
                     port_set = true;
                 }
                 "--debug-clipboard" => debug = true,
+                "--allow-insecure-clipboard-write" => allow_write = true,
                 "--show-token" => show_token = true,
                 "--help" | "-h" => help = true,
                 _ => return Err("Unknown or repeated option; use --help"),
             }
         }
-        if show_token && (lan || port_set || debug) {
+        if show_token && (lan || port_set || debug || allow_write) {
             return Err("Use --show-token by itself; it never starts the agent");
+        }
+        if allow_write && !lan {
+            return Err("Clipboard writes require explicit --lan <private-IPv4>");
+        }
+        if allow_write && debug {
+            return Err("Clipboard writes cannot be combined with --debug-clipboard");
         }
         Ok(Self {
             bind: SocketAddrV4::new(ip, port),
             debug,
             show_token,
             help,
+            allow_write,
         })
     }
 }
@@ -79,5 +89,26 @@ mod tests {
         }
         assert!(parse(&["--port", "0"]).is_err());
         assert!(parse(&["--show-token", "--lan", "192.168.1.5"]).is_err());
+    }
+
+    #[test]
+    fn writes_are_opt_in_lan_only_and_cannot_log_contents() {
+        assert!(!parse(&[]).unwrap().allow_write);
+        assert!(!parse(&["--lan", "192.168.1.5"]).unwrap().allow_write);
+        assert!(parse(&["--allow-insecure-clipboard-write"]).is_err());
+        assert!(
+            parse(&["--lan", "192.168.1.5", "--allow-insecure-clipboard-write"])
+                .unwrap()
+                .allow_write
+        );
+        assert!(
+            parse(&[
+                "--lan",
+                "192.168.1.5",
+                "--allow-insecure-clipboard-write",
+                "--debug-clipboard"
+            ])
+            .is_err()
+        );
     }
 }

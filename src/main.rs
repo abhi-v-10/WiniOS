@@ -1,27 +1,29 @@
+#[cfg(windows)]
+mod app;
+mod auth;
 mod clipboard;
+mod config;
+mod http;
+#[cfg(windows)]
+mod native;
 #[cfg(windows)]
 mod watcher;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut debug = false;
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--debug-clipboard" => debug = true,
-            "--help" | "-h" => {
-                println!(
-                    "winios-agent [--debug-clipboard]\nWarning: --debug-clipboard logs sensitive clipboard text."
-                );
-                return Ok(());
-            }
-            _ => return Err(format!("Unknown argument: {arg}").into()),
-        }
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = config::Config::parse(std::env::args().skip(1))?;
+    if config.help {
+        println!(
+            "winios-agent [--lan <private-IPv4>] [--port <1-65535>] [--debug-clipboard]\nwinios-agent --show-token\n\nDefault: 127.0.0.1:8765. --show-token explicitly reveals the secret and exits.\n--debug-clipboard logs sensitive clipboard contents. HTTP is unencrypted."
+        );
+        return Ok(());
     }
     #[cfg(windows)]
-    watcher::run(clipboard::ClipboardStore::default(), debug)?;
+    app::run(config).await?;
     #[cfg(not(windows))]
     {
-        let _ = debug;
-        return Err("The clipboard watcher requires Windows.".into());
+        let _ = config;
+        return Err("The WiniOS agent requires Windows.".into());
     }
     #[cfg(windows)]
     Ok(())

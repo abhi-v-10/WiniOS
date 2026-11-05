@@ -179,7 +179,7 @@ enum ReadError {
     Changed,
 }
 
-fn sequence() -> Option<u32> {
+pub fn sequence() -> Option<u32> {
     match unsafe { GetClipboardSequenceNumber() } {
         0 => None,
         value => Some(value),
@@ -369,7 +369,17 @@ impl Capture {
     }
 }
 
-pub fn run(store: ClipboardStore, debug: bool) -> Result<()> {
+pub fn request_shutdown() -> Result<()> {
+    let thread = MESSAGE_THREAD.load(Ordering::SeqCst);
+    if thread != 0 {
+        unsafe {
+            PostThreadMessageW(thread, SHUTDOWN, WPARAM(0), LPARAM(0))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn run(store: ClipboardStore, debug: bool, ready: impl FnOnce()) -> Result<()> {
     let window = Window::new()?;
     let console = ConsoleHandler::new()?;
     println!("WiniOS clipboard watcher started. Press Ctrl+C to stop.");
@@ -380,6 +390,7 @@ pub fn run(store: ClipboardStore, debug: bool) -> Result<()> {
     // queued; matching sequence notifications are harmless.
     let mut capture = Capture::new(store, debug);
     capture.attempt(&window)?;
+    ready();
     let mut msg = MSG::default();
     loop {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;

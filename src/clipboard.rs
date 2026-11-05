@@ -72,6 +72,7 @@ pub enum UnavailableReason {
     RetriesExhausted,
     SequenceUnknown,
     ChangedDuringRead,
+    WatcherStopped,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +169,16 @@ impl ClipboardStore {
             .unwrap_or_else(|p| p.into_inner())
             .snapshot
             .clone()
+    }
+
+    /// Check that a response snapshot has not been invalidated while it was built.
+    pub fn is_current(&self, version: u64) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot
+            .version
+            == version
     }
 
     /// Invalidate before accessing Win32, including the initial startup read.

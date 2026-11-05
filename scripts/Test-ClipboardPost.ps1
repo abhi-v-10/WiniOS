@@ -1,6 +1,16 @@
-param([Parameter(Mandatory = $true)][uri]$BaseUri)
+#Requires -Version 7.4
+param(
+    [Parameter(Mandatory = $true)][uri]$BaseUri,
+    [string]$CaCertificate,
+    [switch]$AllowInsecureHttp
+)
 $ErrorActionPreference = 'Stop'
-if ($BaseUri.Scheme -ne 'http' -or $BaseUri.UserInfo -or $BaseUri.Query) { throw 'Use the printed http://private-IP:port base URL without credentials or a query.' }
+if ($BaseUri.UserInfo -or $BaseUri.Query -or $BaseUri.Fragment -or $BaseUri.AbsolutePath -ne '/') { throw 'Use the printed base URL without credentials, path, or query.' }
+if ($BaseUri.Scheme -ne 'https' -and -not ($AllowInsecureHttp -and $BaseUri.Scheme -eq 'http')) { throw 'HTTPS is required; legacy HTTP tests need explicit -AllowInsecureHttp.' }
+if ($CaCertificate -and $BaseUri.Scheme -ne 'https') { throw 'A CA certificate is only applicable to HTTPS.' }
+$targetIp = [Net.IPAddress]::Parse($BaseUri.Host)
+$targetBytes = $targetIp.GetAddressBytes()
+if ($targetBytes.Length -ne 4 -or -not ($targetBytes[0] -eq 127 -or $targetBytes[0] -eq 10 -or ($targetBytes[0] -eq 172 -and $targetBytes[1] -ge 16 -and $targetBytes[1] -le 31) -or ($targetBytes[0] -eq 192 -and $targetBytes[1] -eq 168))) { throw 'Tests are limited to private/loopback IPv4.' }
 # Intentionally overwrites the clipboard with disposable test data. Never prints
 # clipboard contents, HTTP bodies, Authorization headers, or the stored token.
 Add-Type -TypeDefinition @'
@@ -74,6 +84,25 @@ public static class WiniOSPostTestNative {
 '@
 $handler = [System.Net.Http.SocketsHttpHandler]::new()
 $handler.UseProxy = $false
+$handler.AllowAutoRedirect = $false
+$publicCa = $null
+if ($CaCertificate) {
+    # Per-test trust anchor, not a validation callback or OS trust-store change.
+    # Platform TLS still verifies the signature, chain, validity, EKU and URL IP.
+    $publicCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new([IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $CaCertificate)))
+    if ($publicCa.HasPrivateKey) { throw 'Supply only the public CA certificate, never a PFX/private identity.' }
+    $caConstraints = $publicCa.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' }
+    if (-not $caConstraints -or -not $caConstraints.CertificateAuthority) { throw 'Supply the public CA certificate, not the server leaf certificate.' }
+    $policy = [Security.Cryptography.X509Certificates.X509ChainPolicy]::new()
+    $policy.TrustMode = [Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+    [void]$policy.CustomTrustStore.Add($publicCa)
+    [void]$policy.ApplicationPolicy.Add([Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.1'))
+    $policy.VerificationFlags = [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+    # This offline private CA has no CRL/OCSP service. Revocation is manual root
+    # removal + key/CA rotation; signature, time and hostname checks remain on.
+    $policy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+    $handler.SslOptions.CertificateChainPolicy = $policy
+}
 $client = [System.Net.Http.HttpClient]::new($handler)
 $client.Timeout = [TimeSpan]::FromSeconds(8)
 $endpoint = [uri]::new($BaseUri, '/v1/clipboard')
@@ -101,9 +130,11 @@ try {
     $hold = [WiniOSPostTestNative]::Hold(500)
     try { $retried = Send-TestPost $sample } finally { $hold.Join() }
     if ([int]$retried.StatusCode -ne 200) { throw 'Write did not recover from temporary contention.' }
-    $hold = [WiniOSPostTestNative]::Hold(1800)
+    $hold = [WiniOSPostTestNative]::Hold(2500)
     try { $busy = Send-TestPost 'disposable text that must not be written' } finally { $hold.Join() }
-    if ([int]$busy.StatusCode -ne 503) { throw 'Write contention did not exhaust bounded retries.' }
+    if ([int]$busy.StatusCode -ne 503) {
+        throw "Write contention expected HTTP 503 but received HTTP $([int]$busy.StatusCode)."
+    }
     if ([WiniOSPostTestNative]::Text() -cne $sample) { throw 'Failed write modified clipboard.' }
     # This is a deliberate local copy, independent of the agent write API.
     Set-Clipboard -Value $sample
@@ -119,4 +150,5 @@ try {
     $sample = $null
     $client.Dispose()
     $handler.Dispose()
+    if ($publicCa) { $publicCa.Dispose() }
 }

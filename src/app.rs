@@ -3,11 +3,11 @@ use crate::{
     config::Config,
     http::{self, ApiState},
     native::{self, AppError, SingleInstance},
-    watcher,
+    transport, watcher,
     writes::{QUEUE_CAPACITY, WriteClient},
 };
-use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::oneshot};
+use std::{net::TcpListener, sync::Arc, time::Duration};
+use tokio::sync::oneshot;
 
 pub async fn run(config: Config) -> Result<(), AppError> {
     if config.show_token {
@@ -18,8 +18,14 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         return Ok(());
     }
     let _instance = SingleInstance::acquire()?;
+    let tls = match config.tls_paths()? {
+        Some((cert, key)) => Some(transport::load_identity(&cert, &key).await?),
+        None => None,
+    };
+    let scheme = if tls.is_some() { "https" } else { "http" };
     let token = Arc::new(native::load_or_create_token()?);
-    let listener = TcpListener::bind(config.bind).await?;
+    let listener = TcpListener::bind(config.bind)?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     let store = ClipboardStore::default();
     let (write_sender, write_receiver) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
@@ -59,7 +65,7 @@ pub async fn run(config: Config) -> Result<(), AppError> {
             .into());
     }
     println!(
-        "WiniOS HTTP: http://{address} (selected IP {}, port {})",
+        "WiniOS API: {scheme}://{address} (selected IP {}, port {})",
         address.ip(),
         address.port()
     );
@@ -67,26 +73,21 @@ pub async fn run(config: Config) -> Result<(), AppError> {
         "Token is in Windows Credential Manager; reveal explicitly with: cargo run -- --show-token"
     );
     println!(
-        "iPhone Shortcut: URL http://{address}/v1/clipboard -> Get Contents of URL (GET, Authorization: Bearer <token>) -> Copy to Clipboard."
+        "iPhone Shortcut: URL {scheme}://{address}/v1/clipboard -> Get Contents of URL (GET, Authorization: Bearer <token>) -> Copy to Clipboard."
     );
     if address.ip().is_loopback() {
         println!("iPhone access requires restarting with --lan <private-Wi-Fi-IPv4>.");
     }
-    println!(
-        "WARNING: HTTP is unencrypted. Disposable, non-sensitive text on trusted Wi-Fi only; never port-forward this service."
-    );
+    if config.insecure_http {
+        println!(
+            "WARNING: explicit legacy HTTP mode is unencrypted. Disposable text only; no port forwarding."
+        );
+    }
     if config.allow_write {
-        println!("Development POST /v1/clipboard is ENABLED. Disposable text only.");
+        println!("Opt-in POST /v1/clipboard is ENABLED.");
     }
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
-        let _ = stop_rx.await;
-    })
-    .into_future();
+    let server = transport::serve(listener, app, tls, stop_rx);
     tokio::pin!(server);
     let (server_result, watcher_result) = tokio::select! {
         result = &mut server => {

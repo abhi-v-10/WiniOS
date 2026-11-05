@@ -1,263 +1,271 @@
-# WiniOS agent — Mission 003
+# WiniOS — Mission 004A: HTTPS on a private LAN
 
-A Windows clipboard watcher using Win32, with a minimal Axum/Tokio HTTP API for
-bidirectional Windows ↔ iPhone text transfer. POST writes are disabled by default.
-No frontend, cloud service, Bluetooth, or periodic clipboard polling is included.
+Stage A adds Rustls HTTPS around the physically verified Win32 clipboard core.
+There is no device pairing, cloud relay, Bluetooth, frontend, automatic forwarding,
+port forwarding, firewall modification, or periodic clipboard polling.
+Bearer authentication remains required for both clipboard endpoints. HTTPS protects
+it in transit when clients validate the correct server certificate. Continue using
+non-sensitive/disposable text during Stage A validation.
 
-**Bearer-authenticated HTTP is not encrypted.** This prototype is only for
-disposable, non-sensitive text on a trusted LAN. Anyone able to inspect the HTTP
-traffic can capture the text and bearer token. HTTPS or another authenticated,
-encrypted transport is mandatory before broader everyday use. Never port-forward
-this service, publish it through a tunnel/proxy, or allow it on Public networks.
+## Architecture and defaults
 
-## Run
+- Axum routes, auth, state machine, native message loop, command queue, origin
+  tracking, Unicode handling, acknowledgements and native retries are unchanged.
+- `src/transport.rs` uses maintained `axum-server` 0.8 / Rustls 0.23 with the explicit
+  ring provider and TLS 1.2/1.3. The actual accepted TCP peer reaches `ConnectInfo`;
+  proxy headers are not trusted. The test suite proves this with a `127.0.0.2` client.
+- HTTPS is the default, including loopback. Default bind remains `127.0.0.1:8765`.
+  LAN requires a specific assigned RFC1918 IPv4 via `--lan`; wildcard/public/IPv6
+  binds remain rejected. Only private/loopback IPv4 peers reach the API.
+- The default identity paths are `%LOCALAPPDATA%\WiniOS\tls\server.cert.pem` and
+  `server.key.pem`. Override with **both** `--tls-cert` and `--tls-key`.
+- Missing/invalid PEM or mismatched keys fail startup before binding. Expired,
+  untrusted or wrong-identity certificates are refused by validating clients.
+  Rustls loads identities but does not replace client-side certificate validation;
+  monitor certificate dates. There is no HTTP fallback or redirect on this port.
+- The single Win32 OS thread owns clipboard reads/writes and Ctrl+C/Ctrl+Break.
+  Tokio runs the API. Shutdown closes queued writes and drains the server for up
+  to five seconds; TLS handshakes are limited to three seconds. A single-instance
+  Windows mutex prevents multiple service instances in the session.
 
-Requires Windows and a Rust toolchain with the Windows SDK/linker installed.
-Install Rust with the MSVC toolchain and Visual Studio Build Tools with the
-Desktop development with C++ workload/Windows SDK if they are not already present.
-Stop an older watcher before rebuilding: Windows locks a running executable.
+## 1. Provision certificates on Windows
+
+Use PowerShell **7.4+**, the existing MSVC Rust toolchain and Windows SDK. No Mac,
+Xcode, additional iOS app, OpenSSL installation, or commercial/public CA is needed.
+Stop older agents before rebuilding; Windows locks running executable files.
 
 ```powershell
 cd C:\WiniOS
-cargo run
+cargo build
+.\scripts\New-WiniOSTlsCertificate.ps1 -IpAddress 192.168.1.7
 ```
 
-This starts one agent on `http://127.0.0.1:8765`. A named Windows mutex prevents
-another service instance in the same Windows session. The Win32 watcher runs on
-one dedicated OS thread; Tokio's main thread runs HTTP. Both share the private-lock
-`ClipboardStore`. Ctrl+C/Ctrl+Break stops the watcher, invalidates readable state,
-and gracefully drains HTTP for up to five seconds. Server failure requests watcher
-shutdown; the watcher thread is joined before normal application exit.
+The script prompts securely for a **unique, strong CA password, at least 20
+characters**. Prefer a long random password held in your password manager. Do not
+put it on a command line, in source, in logs, or in a plaintext configuration file.
 
-For iPhone access, use `ipconfig` to find your Wi-Fi adapter's private IPv4 address,
-then explicitly bind that address (replace the example with your actual address):
+What is created (no certificates are trusted/installed automatically):
+
+| Location | Contents / handling |
+| --- | --- |
+| `%LOCALAPPDATA%\WiniOS\ca-offline` | Public CA certificate and password-encrypted `ca.key.encrypted.pem`. Keep signing key + password separate from routine service operation. |
+| `%LOCALAPPDATA%\WiniOS\tls` | Server-only `server.key.pem`, `server.cert.pem`, and public `winios-ca.cer`. Only the public `.cer` goes to the phone. |
+
+Both directories receive protected Windows DACLs allowing only the current user
+and SYSTEM; new key files inherit those permissions. Paths inside the Git workspace,
+reparse-point paths and nested CA/runtime directories are rejected. The CA key uses
+PBKDF2-SHA256 (210,000 iterations) / AES-256 encrypted PKCS#8. The runtime server
+key is unencrypted PKCS#8 PEM protected by its DACL, because unattended Rustls must
+read it. The agent never reads the CA signing key or asks for its password.
+Administrators can take ownership, and malware running as your user can read the
+runtime key. ACLs do not protect a compromised Windows account.
+
+**A directory named `ca-offline` is not automatically offline.** After issuance,
+move its encrypted signing material to a protected offline NTFS/BitLocker volume
+and keep the password separately. Alternatively provision directly there:
 
 ```powershell
-cargo run -- --lan 192.168.1.42 --port 8765
+.\scripts\New-WiniOSTlsCertificate.ps1 -IpAddress 192.168.1.7 -CaDirectory E:\WiniOS-CA-192.168.1.7
 ```
 
-`--lan` requires a specific RFC1918 IPv4 address assigned to this PC; wildcard,
-public, IPv6, and link-local binds are rejected. The selected IP/port and URL are
-printed at startup. Only loopback/private IPv4 peers are accepted. This does not
-replace firewall or router controls; do not forward or proxy the port.
+Use an NTFS location supporting Windows ACLs; unsupported permissions cause failure.
+Keep an encrypted backup. The server needs only the runtime leaf identity. Neither
+private key belongs in Git; `.gitignore` additionally excludes PEM/key/PFX/P12 files.
+Do not copy whole CA/runtime directories to the phone.
 
-## Token setup
+The dedicated CA and separate leaf use ECDSA P-256 / SHA-256. CA lifetime is one
+year, `CA=true`, path length zero, cert-signing usage and serverAuth-only EKU.
+Critical name constraints permit only the selected private IP and `127.0.0.1`,
+and the reserved `winios.invalid` DNS subtree. The leaf is **not a CA**, has
+serverAuth EKU, digitalSignature usage, and at most 90 days validity (also capped
+by CA expiration). Its **IP subjectAltName** contains `192.168.1.7` and loopback;
+identity does not rely on CN or wildcards. The reserved leaf CN is also within the
+CA's DNS constraints for Windows compatibility. Issuance validates the chain with
+Windows before publishing the identity. The public CA's SHA-256 fingerprint is printed.
 
-On the first service start, Windows `BCryptGenRandom` generates 32 random bytes
-(256 bits), encoded as a 64-character lowercase hex token. The token is saved as
-a per-user Generic Credential named `WiniOS/Agent/Bearer/v1` in Windows Credential
-Manager, persisting for that user on this computer. It is not stored in the repo,
-an ordinary file, a URL, or normal application logs. Token validation uses a
-constant-time comparison for equal-length values. See Microsoft's
-[credential storage contract](https://learn.microsoft.com/en-us/windows/win32/api/wincred/ns-wincred-credentialw).
+## 2. Run HTTPS
 
-To explicitly reveal it in your terminal after the first service start:
+After provisioning at the default runtime path:
+
+```powershell
+cargo run -- --lan 192.168.1.7 --port 8765 --allow-clipboard-write
+```
+
+POST remains opt-in. Omit `--allow-clipboard-write` for read-only HTTPS. It requires
+explicit private LAN binding and cannot be combined with the diagnostic flag.
+Non-default runtime paths use:
+
+```powershell
+cargo run -- --lan 192.168.1.7 --port 8765 --tls-cert 'D:\WiniOS-runtime\server.cert.pem' --tls-key 'D:\WiniOS-runtime\server.key.pem' --allow-clipboard-write
+```
+
+The URL is `https://192.168.1.7:8765/v1/health`. Keep the terminal running; Ctrl+C
+stops both subsystems. A private certificate's trust is not automatic. An untrusted
+browser warning is a failed test, not an instruction to click through.
+
+## 3. Review and trust only the public CA on iPhone
+
+Installing a root adds an explicit trust anchor to the device, potentially affecting
+**other apps and sites**, not just this Shortcut. The constraints reduce scope on
+clients that enforce them, but do not assume every trust engine enforces constraints
+on trust anchors identically. CA-key compromise can therefore be serious. Use this
+CA only for WiniOS, only on devices you control, never as a public/global or shared
+organization CA. The script never changes Windows or iOS trust stores.
+
+1. On Windows, record the printed SHA-256 CA fingerprint. Verify it independently:
+
+```powershell
+$runtimeTls = Join-Path $env:LOCALAPPDATA 'WiniOS\tls'
+certutil -hashfile (Join-Path $runtimeTls 'winios-ca.cer') SHA256
+```
+
+2. Transfer **only** `winios-ca.cer` using an existing trusted attachment/file-transfer
+   channel. For example, the built-in iPhone Mail app can open a public `.cer`
+   attachment sent from Windows. WiniOS implements no mail/cloud transfer service.
+   Do not download and trust an unauthenticated substituted root. Verify the fingerprint
+   out of band from the Windows screen; inspect iOS certificate details/fingerprints
+   where available. If the UI cannot show the fingerprint, establish file authenticity
+   through your trusted transfer channel before trusting it; do not waive review.
+3. Tap the public certificate. In Settings, review **Profile Downloaded**, or
+   **General → VPN & Device Management**. Review the WiniOS CA identity, dates and
+   certificate details, then explicitly install it using the device passcode.
+4. Go to **Settings → General → About → Certificate Trust Settings** and explicitly
+   enable full trust for this WiniOS root. Review the warning. Installation alone
+   does not grant TLS trust. [Apple's manual trust instructions](https://support.apple.com/en-us/102390).
+5. In Safari, open **https://192.168.1.7:8765/v1/health**. It must load fixed
+   non-sensitive JSON without any certificate warning. If it fails, stop here and
+   correct trust/IP/date/chain problems. Never ignore certificate errors or disable
+   TLS verification.
+
+Never send `ca.key.encrypted.pem`, `server.key.pem`, their passwords, a private-key
+PEM, or a PFX/PKCS#12 to iPhone. The public `.cer` contains no private key. No PKCS#12
+export/import is used by this workflow.
+
+## 4. Existing Shortcuts: change URLs only
+
+After root installation and trust, change the URL in both existing Shortcuts to
+**https://192.168.1.7:8765/v1/clipboard**. Keep the same bearer header, actions,
+JSON schema and result handling. No TLS bypass/custom validation action is needed.
+
+- GET: **Get Contents of URL → GET**, header `Authorization: Bearer <token>`;
+  if the result has a value, **Copy to Clipboard**. Empty/error responses must not
+  copy an old action result. Valid zero-length text still yields 200 with no bytes.
+- POST: **Get Clipboard → Get Contents of URL → POST**, same Authorization header,
+  **Request Body: JSON**, Text field `text` using the Get Clipboard magic variable.
+  Let Shortcuts encode the JSON. Only show success when response dictionary `status`
+  equals `ok`. HTTP errors/transport failures must not show success.
+- Allow iOS local-network permission when prompted. No additional iPhone app is
+  necessary. The bearer token remains the initial application authentication, not
+  device pairing or mutual TLS. Do not share Shortcuts containing that secret.
+
+## API behavior remains unchanged
+
+| Request / condition | Status / body |
+| --- | --- |
+| GET `/v1/health`, no auth | 200 fixed liveness JSON, no clipboard/token/status details |
+| GET/POST clipboard missing or invalid bearer | 401 empty + Bearer challenge |
+| GET available, native sequence still current | 200 exact UTF-8 `text/plain; charset=utf-8` |
+| GET empty / stale / unavailable | 204 / 409 / 503, no cached text |
+| Oversized text | 413 |
+| POST not enabled or peer forbidden | 403 |
+| POST malformed JSON / wrong content type / invalid schema or NUL | 400 / 415 / 422 |
+| POST accepted by Windows | 200 `{"status":"ok","operation":N,"sequence":S}` |
+| POST body timeout / ack timeout / busy-or-stopped / native failure | 408 / 504 / 503 / 500 |
+
+All responses retain `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+Tokens, clipboard text, bodies and private keys are not service logs. The legacy
+`--debug-clipboard` name enables only metadata/error diagnostics in read-only mode.
+
+POST accepts only `{"text":"..."}`. UTF-8 text and UTF-16 source are each capped at
+1 MiB, preserving the previous limit (ASCII therefore fits at most 524,288 characters).
+A bounded 6 MiB + 64 byte HTTP body allows JSON escape expansion before deserialization.
+Malformed Unicode and embedded NUL are rejected; LF, CRLF and other valid Unicode
+are preserved. Authentication occurs before body parsing. Body read timeout is
+five seconds; the four-slot command queue plus one active native command is unchanged.
+Native writes still run only on the Win32 message thread with ownership-transfer
+RAII and bounded timer retries. Expired/disconnected queued commands are skipped.
+A 504/lost connection can be an **uncertain** outcome if native commit was already
+underway: inspect Windows before retrying. There is no durable replay/idempotency
+protocol. If EmptyClipboard succeeded before a native SetClipboardData failure,
+previous formats may have been lost; the state is invalidated, never falsely served.
+
+## Bearer credential lifecycle
+
+The existing 256-bit token remains in per-user Windows Credential Manager as
+`WiniOS/Agent/Bearer/v1`. HTTPS does not change or rotate it. To explicitly reveal
+it for initial Shortcut setup, use the separate export command (never redirect it
+to a log or file):
 
 ```powershell
 .\target\debug\winios-agent.exe --show-token
 ```
 
-This command reads the credential and exits; it does **not** start another
-watcher or HTTP listener. Its output is intentionally secret: avoid recording,
-redirecting, committing, or sharing it. Type it into your iPhone Shortcut's header.
-Other processes running as your Windows user can access the credential; it is not
-protection from a compromised PC. The Shortcut also contains the secret; do not
-share it or treat it as safe for sensitive content.
+It starts no watcher/server. To rotate: stop the agent, remove only this Generic
+Credential through Credential Manager, restart, and replace both Shortcut headers.
+Rotate after any exposure during earlier plaintext development or suspected MITM.
+Other processes running as your Windows user can read this credential.
 
-To rotate the token, stop the agent, remove that Generic Credential through
-Control Panel → Credential Manager → Windows Credentials, and restart. Update
-the Shortcut with the newly generated token. Never remove it while the agent is
-running: the server keeps its startup token in memory until shutdown.
+## Renewal, IP changes, revocation and compromise
 
-## HTTP endpoints
+- Check `ipconfig` and certificate expiry before testing. A DHCP reservation for
+  `192.168.1.7` reduces churn but does not replace certificate identity validation.
+- For routine leaf renewal, stop the agent, reconnect the protected offline CA,
+  and run the provisioning script with the **same IP and CA directory** plus
+  `-Renew`. Enter the CA password privately. It creates a new leaf key/certificate
+  under the same CA, preserving the CA fingerprint. Restart the agent; return the
+  signing material offline. Renew before the 90-day leaf deadline.
+- The script refuses renewal with under 30 days CA life remaining. Rotate the CA
+  in new, separate directories, issue a new leaf, explicitly review/install/trust
+  the new public CA on iPhone, and remove the old profile/root trust. Never overwrite
+  the only offline backup before migration succeeds.
+- IP changes require a **new scoped CA and leaf**, because the existing CA is
+  constrained to the old IP. Use new CA/runtime directories (or move the previous
+  identities securely aside), provision for the new private IP, replace iPhone root
+  trust, restart with new paths/address, update both HTTPS URLs and any narrowly
+  scoped firewall rule, and remove old trust. Never change URLs to evade mismatch.
+- This offline CA has no OCSP/CRL infrastructure. Native test clients intentionally
+  use no online revocation fetch; signature, date, EKU, constraints and hostname
+  validation remain enabled. Revocation is manual removal of the trusted root/profile
+  and replacement of identities. If a **leaf key** is compromised, issuing another
+  leaf under the same CA does not immediately revoke the stolen one: rotate the CA
+  and remove old trust from every client. Do the same after CA-key compromise, and
+  rotate bearer tokens. Short validity limits exposure but is not revocation.
+- On iPhone, disable this root in Certificate Trust Settings and remove its WiniOS
+  profile under VPN & Device Management. Do not remove unrelated profiles. If you
+  explicitly imported it into a Windows user root store, remove only its verified
+  thumbprint there too. Provisioning/test scripts do not install any root for you.
 
-| Request/outcome | Status | Body |
-| --- | --- | --- |
-| `GET /v1/health` (no token) | 200 | Fixed non-sensitive JSON liveness status |
-| `GET /v1/clipboard`, missing/invalid bearer | 401 | Empty; `WWW-Authenticate: Bearer` |
-| Available, current known sequence | 200 | Exact text, `text/plain; charset=utf-8`, at most 1 MiB |
-| Empty clipboard (no formats) | 204 | Empty |
-| Stale snapshot/changed store revision | 409 | Empty; retry after watcher catches up |
-| Pending, inaccessible, unsupported, malformed, stopped, or unknown sequence | 503 | Empty; no previous text fallback |
-| Oversized text rejected | 413 | Empty |
-| Non-private/non-loopback peer | 403 | Empty |
+## Firewall and troubleshooting
 
-Only clipboard requests require `Authorization: Bearer <token>`. Duplicate
-Authorization headers and malformed credentials are rejected. Every response has
-`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. There is no CORS
-permission, request/body/header access logging, or token in query parameters.
-Health is liveness only; it does not claim clipboard availability.
+Keep the existing **Private-profile, program/port, LocalSubnet** firewall boundary.
+HTTPS uses the same TCP port 8765 and executable path; normally no new rule is needed.
+Do not disable the firewall, add Public-profile rules, forward ports, add cloud
+relays/tunnels, or expose wildcard listeners. No rules are changed automatically.
 
-Every clipboard request obtains a fresh owned snapshot. After constructing the
-response, the handler checks the store revision and calls Windows
-`GetClipboardSequenceNumber` immediately before handing the response to Axum.
-Unknown/zero or mismatched sequence numbers refuse content. The private dedup
-baseline is never part of a response. A clipboard change *after* this final check
-cannot retract bytes already handed to the network; the API is a point-in-time
-transfer, not a lock held through transmission.
+For timeouts check PC sleep, printed IP/port, matching Wi-Fi, guest/AP isolation,
+VPN routing, iOS local-network permission, Private profile and existing executable
+path in the firewall rule. Certificate errors are different from connectivity:
+check the exact URL IP against the IP SAN, device clocks, leaf/CA expiration, correct
+root fingerprint and explicit iOS full-trust switch. A 401 means HTTPS connected but
+the bearer header is wrong. A 403 POST means the write flag is absent. 409/503 means
+retry once the clipboard settles. Never solve a TLS failure with a verification
+bypass, a CN-only certificate, or automatic downgrade.
 
-## Development-only iPhone → Windows writes
+## Explicit legacy development mode only
 
-Enable POST explicitly on your assigned private LAN address:
-
-```powershell
-cargo run -- --lan 192.168.1.42 --port 8765 --allow-insecure-clipboard-write
-```
-
-The write flag is rejected without explicit private `--lan` binding. It cannot be
-combined with the legacy diagnostic flag. Without it, authenticated POST requests
-get 403; GET continues working as before. No firewall rules are changed.
-Plaintext HTTP exposes both credentials and submitted text, and anyone holding
-the token can replace your Windows clipboard while POST is enabled. Use only
-disposable test text. HTTPS or another authenticated encrypted channel is required
-before everyday use. Do not port-forward, tunnel, or proxy this endpoint publicly.
-
-Send `POST /v1/clipboard` with `Content-Type: application/json`, the existing
-`Authorization: Bearer <token>` header, and a JSON object such as:
-
-```json
-{"text":"Hello from iPhone"}
-```
-
-Only the `text` string field is accepted. Text must be valid Unicode with no
-embedded NUL. Empty strings and newline characters are supported; LF/CRLF and
-Unicode are preserved exactly. Both the UTF-8 payload and UTF-16 source retain
-the existing 1 MiB limits (thus ASCII is capped at 524,288 characters by UTF-16).
-Before JSON deserialization, the HTTP body is capped at 6 MiB + 64 bytes, allowing
-JSON escape expansion of valid text. Body upload/read is limited to five seconds.
-Unauthorized/disabled requests are rejected before reading the body, and parser
-diagnostic bodies are discarded so input cannot leak through error responses.
-
-| POST outcome | Status |
-| --- | --- |
-| Windows accepted `SetClipboardData` | 200, JSON `{"status":"ok","operation":N,"sequence":S}` |
-| Missing/incorrect bearer | 401 |
-| Writes disabled or peer disallowed | 403 |
-| Malformed JSON | 400 |
-| Incorrect content type | 415 |
-| Invalid/missing text field, extra fields, embedded NUL | 422 |
-| Text or encoded HTTP body too large | 413 |
-| Body read deadline reached | 408 |
-| Queue full, worker stopped, or contention retries exhausted | 503 |
-| Native allocation/clipboard commit failed | 500 |
-| Write acknowledgement deadline reached | 504 |
-
-HTTP handlers send owned Rust strings through a four-slot Tokio command channel;
-one additional command can be active. A posted Win32 message wakes the existing
-message thread. Only that thread allocates moveable global memory, copies
-NUL-terminated UTF-16, opens/empties the clipboard, and calls `SetClipboardData`.
-Failed writes free their allocations; successful ownership transfer disarms the
-free guard. See [Microsoft's ownership contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setclipboarddata).
-
-Clipboard contention uses a separate Win32 timer with the same six bounded
-backoffs (20–640 ms); there are no sleeps in the message loop. Each queued command
-expires after three seconds including queue time. Expired/disconnected commands
-are checked again immediately before the destructive native commit and skipped.
-An acknowledgement is sent only after Windows accepts ownership. **A 504 or a
-lost connection is not proof that no write occurred:** if the native commit was
-already underway, it cannot be undone safely. Inspect the clipboard before
-retrying an uncertain operation; there is no durable idempotency/replay protocol.
-If `EmptyClipboard` succeeds and `SetClipboardData` subsequently fails, previous
-formats may already be lost; the store is invalidated and no success is returned.
-
-Accepted writes have `Iphone` origin (meaning an authenticated API write, not
-verified device identity) and a process-session operation ID. Their own matching
-sequence/owner notifications are suppressed and produce `Update::Remote`, not an
-outgoing local-change event. GET can still read the accepted text. A later local
-copy—even the same text—gets `WindowsClipboard` origin and a new local update.
-No automatic forwarding or background bidirectional sync is implemented.
-
-Shutdown closes the command receiver and fails active/queued requests. Already
-accepted commits remain valid; queued commands are not replayed after restart.
-
-### iPhone “Send to Windows” Shortcut
-
-1. Enable the development flag above and connect both devices to trusted Wi-Fi.
-2. Add **Get Clipboard** as the first action in a new Shortcut.
-3. Add **URL** using `http://<printed-PC-IP>:8765/v1/clipboard`.
-4. Add **Get Contents of URL**, select **POST**, and set the header
-   **Authorization** to **Bearer <your existing token>**. Do not put it in the URL.
-5. Set **Request Body** to **JSON**. Add a **Text** field named `text` and select
-   the magic variable from **Get Clipboard** as its value. Let Shortcuts encode
-   the JSON; do not manually interpolate clipboard text into a JSON string.
-   Shortcuts should set `Content-Type: application/json` for the JSON body.
-6. Read the response dictionary's `status` field. Only if it equals `ok`, show
-   **Show Notification** → “Sent to Windows”. On errors, stop/show a failure
-   notification; never show success unconditionally.
-7. Copy disposable text on iPhone, run the Shortcut, then Ctrl+V into Notepad.
-   Repeat with emoji, accents, and multiple lines. Run the existing GET Shortcut
-   afterward to verify Windows → iPhone still works.
-
-For 403, restart with both required flags; for 415, select JSON request body;
-for 422, ensure `text` is a string rather than a list/image/URL object. For 503,
-close clipboard tools temporarily and retry once contention settles. For 504,
-check what was actually pasted before retrying. The Windows clipboard may change
-again immediately after acceptance if another application copies something.
-
-## Apple Shortcuts setup
-
-1. Connect the iPhone and PC to the same trusted Wi-Fi. Start the agent with
-   `--lan <PC-Wi-Fi-IPv4>`; `127.0.0.1` on the iPhone refers to the phone itself.
-2. In Shortcuts, create a shortcut named **Get Windows Clipboard**. Add a **URL**
-   action with `http://192.168.1.42:8765/v1/clipboard` using the printed PC address.
-3. Add **Get Contents of URL**, choose **GET**, expand its options, and add a
-   header: key **Authorization**, value **Bearer ** followed by the exact token
-   (one space; no angle brackets or quotes). Keep the token out of the URL.
-4. Add **If** the request result **has any value**, then **Copy to Clipboard**
-   using the result. In **Otherwise**, show a notification such as “Windows
-   clipboard is empty or unavailable.” This avoids clearing the phone clipboard
-   for empty responses. A valid empty Unicode string also leaves the phone
-   clipboard unchanged with this simple Shortcut. Do not copy HTTP error text.
-5. Allow local-network access if iOS asks. Run the shortcut after copying
-   disposable text on Windows, then paste into Notes to verify it.
-
-Action labels/options can vary by iOS version. Transport/authentication errors may
-stop the Shortcut and show an error; do not continue copying a previous action's
-result. Apple documents the GET action in
-[Request your first API](https://support.apple.com/guide/shortcuts/request-your-first-api-apd58d46713f/ios).
-
-## Windows Firewall and connectivity
-
-First test locally: `curl.exe -i http://127.0.0.1:8765/v1/health` for default mode,
-or use the selected LAN address in LAN mode. A successful health response proves
-connectivity, not authorization. An unauthenticated clipboard request must get 401.
-
-On a trusted home network, use the **Private** Windows network profile and allow
-the actual built executable on **Private networks only** if Windows prompts.
-Never disable the firewall. If a manual rule is needed, run this yourself in an
-Administrator PowerShell after substituting your address and executable path:
+Normal LAN commands no longer expose plaintext. To intentionally run the old
+transport for controlled disposable-text development only:
 
 ```powershell
-New-NetFirewallRule -DisplayName 'WiniOS prototype' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8765 -LocalAddress 192.168.1.42 -RemoteAddress LocalSubnet -Profile Private -Program (Resolve-Path .\target\debug\winios-agent.exe).Path
+cargo run -- --insecure-http --lan 192.168.1.7 --port 8765 --allow-insecure-clipboard-write
 ```
 
-No firewall configuration is changed automatically. To remove your test rule:
-`Remove-NetFirewallRule -DisplayName 'WiniOS prototype'`. If using `--release`,
-update the rule to the release executable path. Review/remove broader pre-existing
-rules yourself; the prototype cannot override router/firewall policy.
-
-For timeouts, check the printed address, port, PC sleep state, Private profile,
-program path in the firewall rule, and iOS local-network permission. Guest Wi-Fi,
-AP/client isolation, VPNs, and different subnets can prevent peer access. A 401
-means connectivity works but the token/header is wrong; 409/503 usually means
-retry after copying valid text and waiting briefly. DHCP address changes require
-restarting with the new address and updating the Shortcut. A bind error means
-the selected address is not assigned locally or the port is occupied.
-
-Keep the terminal running. Initial and new Unicode text produce a local timestamp
-and a Unicode scalar-value count (an emoji sequence can contain multiple characters).
-Clipboard contents are never printed. Stop with **Ctrl+C**; expect
-`WiniOS clipboard watcher stopped.` and the terminal prompt to return.
-
-Optional metadata-only diagnostics (read-only mode):
-
-```powershell
-cargo run -- --debug-clipboard
-```
-
-The legacy flag name is retained, but content logging has been removed. It only
-enables access-error diagnostics. Text, request bodies, and bearer tokens are never
-included in service logs; explicit `--show-token` remains a separate secret-export command.
+Both plaintext mode and plaintext write permission must be explicit. TLS identity
+flags cannot accompany `--insecure-http`; the secure write flag cannot authorize
+plaintext writes. This is a separate listener mode, not fallback from HTTPS. Stop
+one agent before starting another. Never use legacy mode to work around a bad
+certificate. The integration script also requires explicit `-AllowInsecureHttp`
+for that mode; its normal path requires HTTPS with full validation.
 
 ## Design and limits
 
@@ -342,7 +350,7 @@ A change after the final sequence check is invalidated by its queued notificatio
 there is necessarily a notification-delivery interval. Future serving code must
 respect `Unavailable`; the HTTP API also checks sequence freshness before serving.
 
-## Automated checks
+## Verification and exact manual acceptance test
 
 ```powershell
 cargo fmt --check
@@ -350,59 +358,69 @@ cargo check
 cargo test
 ```
 
-Unit tests cover consecutive deduplication, shared latest state, empty text,
-Unicode counting, UTF-16 validity/termination, exact UTF-16 size boundaries,
-UTF-8 expansion limits, explicit invalidation after rejection/failure, startup state,
-version metadata, and rejection of superseded retry results. Regression tests cover
-identical text after one, three, and six temporary failures; repeated observation
-restarts; changed text after retries; and clearing followed by the same text.
-HTTP tests cover authentication failures/success, exact UTF-8 and 1 MiB boundaries,
-empty/unavailable states, retained-baseline non-disclosure, stale/unknown sequence
-rejection, health, and public-peer refusal. Tests use disposable in-memory text
-and injected sequence values; they do not start another Windows watcher or write
-to the real clipboard. The native RNG test does not persist test credentials.
-POST tests cover the feature gate, authentication before parsing, content types,
-JSON/schema/text validation, bounded bodies, acknowledgement ordering, worker
-failures/timeouts, cancellation, bounded queues, and operation-origin behavior.
-One TCP integration test uses an in-process test command consumer rather than
-the real clipboard. It does not assert native Win32 success.
+Mission 004A results: **38 passed, 0 failed**. Coverage includes validated HTTPS
+health and bearer GET/POST, real TCP peer/IP preservation, missing bearer,
+untrusted/wrong-identity/expired certificates, malformed TLS and old plaintext
+requests, missing/malformed PEM and mismatched keys, and bounded shutdown with
+an incomplete TLS handshake. Test CA/leaf keys exist only in memory. Existing
+clipboard/auth/queue/dedup/Unicode/origin tests continue to pass. TLS router POST
+tests use a test command consumer; native behavior is tested separately below.
 
-For an explicit **real Windows API integration test**, first run one agent with
-both LAN/write flags, then execute this in a second PowerShell terminal as the
-same Windows user:
+The Windows provisioning script's new issuance and same-CA renewal were tested,
+including Windows chain validation. The native integration passed **over HTTPS**:
+Unicode + LF/CRLF readback, authenticated writes/GET, repeated operation IDs,
+500 ms contention recovery and 1.8 s contention exhaustion without modifying old
+text. Remote writes emitted no local-change notifications; a later deliberate
+local copy did. Windows also accepted validated HTTPS health and rejected the
+uninstalled CA and wrong server identity. No OS roots/firewall rules were changed.
+Physical iPhone HTTPS Safari/Shortcut tests have **not** been performed by the agent.
+
+After completing certificate provisioning and starting exactly one HTTPS agent:
 
 ```powershell
-.\scripts\Test-ClipboardPost.ps1 -BaseUri http://192.168.1.42:8765
+$runtimeTls = Join-Path $env:LOCALAPPDATA 'WiniOS\tls'
+.\scripts\Test-ClipboardPost.ps1 -BaseUri https://192.168.1.7:8765 -CaCertificate (Join-Path $runtimeTls 'winios-ca.cer')
 ```
 
-This intentionally replaces the Windows clipboard with disposable test data. It
-loads the existing credential without printing it, verifies exact native Unicode
-and mixed-newline readback, GET compatibility, repeated operations, recovery from
-500 ms contention, rejection after 1.8 s contention, and a later deliberate local
-copy. It prints only pass/failure status, never text or credentials. In the agent
-log, the remote writes must not emit local `clipboard updated` events; the final
-deliberate local copy should emit one. Avoid copying other text during the test.
-It starts no additional agent and changes no firewall settings.
+The script requires PowerShell 7.4+, the same Windows credential user, and opt-in
+POST. It intentionally overwrites the Windows clipboard with disposable test text
+and starts no additional agent. `-CaCertificate` configures a **per-client custom
+root trust store**, not a certificate-validation callback: Windows still validates
+chain/signature/date/EKU/constraints and URL IP. It installs no root or trust bypass.
+If omitted, ordinary Windows OS trust is used. Redirects and proxies are disabled.
+The script prints only status, never credentials or clipboard bodies.
 
-## Manual end-to-end test
+Exact device acceptance sequence:
 
-1. Ensure older agents are stopped, then run the single agent with `--lan` and
-   configure the token/header and firewall as above. Check health from iPhone
-   Safari using the printed address; its response must contain no secrets.
-2. Copy `WiniOS Mission 002 😀` from Notepad or VS Code. Run the Shortcut, paste
-   into Notes, and verify exact Unicode and multiline text. Copy the same text
-   repeatedly and verify transfer still works without duplicate successful logs.
-3. Remove/change the Shortcut token: it must refuse the request and must not
-   replace the phone clipboard with an old Windows value. Restore the header.
-4. Clear/replace Windows clipboard contents with an image or invalid/oversized
-   test data. Verify the status codes above and that old text is never returned.
-   Exercise contention and rapid copies: 409/503 is safe; retry once settled.
-5. Press Ctrl+C in the PC terminal. Both watcher/server stopped messages should
-   appear, the process should exit, and the old URL should stop responding.
+1. Provision for `192.168.1.7`, record the public CA fingerprint, and start HTTPS
+   with `--allow-clipboard-write`. Do not keep a legacy HTTP listener running.
+2. Review/install only the public CA on iPhone and enable TLS root trust as above.
+   Safari must load `https://192.168.1.7:8765/v1/health` with no warning.
+3. Update both Shortcut URLs to HTTPS; keep the existing bearer/JSON/actions.
+   Copy disposable Unicode/multiline text on Windows, run GET, and paste in Notes.
+   Copy different disposable text on iPhone, run POST, and Ctrl+V into Notepad.
+   Verify exact characters/newlines and repeat both directions.
+4. Remove/alter the bearer header: requests must still get 401 and POST must not
+   write. Restore the existing token. Disabling the POST flag must yield 403.
+5. Disable/remove the test CA trust on the phone: HTTPS must fail, not show an old
+   cached success. Restore trust only after reviewing the correct root again.
+   Wrong-IP and expired certificate rejection are automated TLS tests; never
+   accept a warning in Safari/Shortcuts to force them through.
+6. An old `http://192.168.1.7:8765/v1/clipboard` request to the **secure** listener
+   must fail at the TLS boundary, not return clipboard text or redirect to HTTP.
+   Afterward valid HTTPS must still work. Do not include a real bearer in this
+   intentional plaintext test; the Rust test already covers that protocol boundary.
+7. Run the native integration script above. Avoid concurrent manual copies while
+   it checks exact bytes. Confirm remote writes produce no local update logs and
+   the final deliberate local copy produces one.
+8. Press Ctrl+C: watcher and API must stop, queued requests must fail/finish safely,
+   and the HTTPS URL must stop responding. Return the CA key offline. Remove
+   development root trust from devices when no longer needed.
 
-Physical iPhone execution, Wi-Fi routing, firewall prompts, and iOS permissions
-require manual validation; automated handler tests cannot establish those.
-
+Remaining platform constraints: actual iOS trust UI, root-name-constraint behavior,
+Shortcuts permissions and physical paste behavior need device verification. No
+pairing, mutual TLS, automated device enrollment or revocation infrastructure is
+part of Stage A.
 ## Manual Windows test
 
 1. Copy disposable text **before** running `cargo run`. Confirm it is observed

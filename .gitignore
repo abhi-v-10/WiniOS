@@ -3,3 +3,9 @@
 
 # rustfmt backups
 **/*.rs.bk
+
+# TLS identities are provisioned outside the repository.
+*.pem
+*.key
+*.pfx
+*.p12

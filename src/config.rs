@@ -8,6 +8,8 @@ pub struct Config {
     pub help: bool,
     pub allow_write: bool,
     pub insecure_http: bool,
+    pub tailnet_backend: bool,
+    pub images: crate::image::Options,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -21,6 +23,9 @@ impl Config {
         let mut allow_write = false;
         let mut insecure_write = false;
         let mut insecure_http = false;
+        let mut tailnet_backend = false;
+        let mut images = crate::image::Options::default();
+        let mut image_limit_set = false;
         let mut tls_cert = None;
         let mut tls_key = None;
         let mut lan = false;
@@ -51,9 +56,20 @@ impl Config {
                     port_set = true;
                 }
                 "--debug-clipboard" => debug = true,
+                "--enable-images" if !images.enabled => images.enabled = true,
+                "--max-image-mib" if !image_limit_set => {
+                    images.max_mib = args
+                        .next()
+                        .ok_or("--max-image-mib requires 2, 4 or 8")?
+                        .parse()
+                        .map_err(|_| "Invalid image maximum")?;
+                    images.validate()?;
+                    image_limit_set = true;
+                }
                 "--allow-clipboard-write" => allow_write = true,
                 "--allow-insecure-clipboard-write" => insecure_write = true,
                 "--insecure-http" => insecure_http = true,
+                "--tailnet-backend" if !tailnet_backend => tailnet_backend = true,
                 "--tls-cert" if tls_cert.is_none() => {
                     tls_cert = Some(PathBuf::from(
                         args.next().ok_or("--tls-cert requires a PEM file path")?,
@@ -76,6 +92,9 @@ impl Config {
                 || allow_write
                 || insecure_write
                 || insecure_http
+                || tailnet_backend
+                || images.enabled
+                || image_limit_set
                 || tls_cert.is_some()
                 || tls_key.is_some())
         {
@@ -83,6 +102,21 @@ impl Config {
         }
         if tls_cert.is_some() != tls_key.is_some() {
             return Err("Supply both --tls-cert and --tls-key");
+        }
+        if tailnet_backend {
+            if lan || insecure_http || insecure_write || tls_cert.is_some() {
+                return Err(
+                    "--tailnet-backend is loopback-only and cannot use LAN, legacy HTTP or TLS identity flags",
+                );
+            }
+            if !port_set {
+                port = 8766;
+            }
+            if port == 8765 {
+                return Err(
+                    "Tailnet backend must use a separate port (default 8766), not LAN port 8765",
+                );
+            }
         }
         if insecure_http && tls_cert.is_some() {
             return Err("--insecure-http cannot be combined with TLS identity flags");
@@ -96,11 +130,19 @@ impl Config {
             return Err("Plaintext writes require --allow-insecure-clipboard-write instead");
         }
         allow_write |= insecure_write;
-        if allow_write && !lan {
-            return Err("Clipboard writes require explicit --lan <private-IPv4>");
+        if allow_write && !lan && !tailnet_backend {
+            return Err(
+                "Clipboard writes require explicit --lan <private-IPv4> or --tailnet-backend",
+            );
         }
         if allow_write && debug {
             return Err("Clipboard writes cannot be combined with --debug-clipboard");
+        }
+        if images.enabled && insecure_http {
+            return Err("Image sharing requires HTTPS or the dedicated Tailscale backend.");
+        }
+        if image_limit_set && !images.enabled {
+            return Err("--max-image-mib requires --enable-images.");
         }
         Ok(Self {
             bind: SocketAddrV4::new(ip, port),
@@ -109,13 +151,15 @@ impl Config {
             help,
             allow_write,
             insecure_http,
+            tailnet_backend,
+            images,
             tls_cert,
             tls_key,
         })
     }
 
     pub fn tls_paths(&self) -> Result<Option<(PathBuf, PathBuf)>, &'static str> {
-        if self.insecure_http {
+        if self.insecure_http || self.tailnet_backend {
             return Ok(None);
         }
         if let (Some(cert), Some(key)) = (&self.tls_cert, &self.tls_key) {
@@ -137,8 +181,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn images_are_opt_in_capped_and_never_use_legacy_http() {
+        assert!(!Config::parse(Vec::<String>::new()).unwrap().images.enabled);
+        let parse = |args: &[&str]| Config::parse(args.iter().map(|v| v.to_string()));
+        assert_eq!(
+            parse(&[
+                "--tailnet-backend",
+                "--enable-images",
+                "--max-image-mib",
+                "4"
+            ])
+            .unwrap()
+            .images
+            .max_mib,
+            4
+        );
+        for args in [
+            vec!["--insecure-http", "--enable-images"],
+            vec!["--max-image-mib", "8"],
+            vec!["--enable-images", "--max-image-mib", "255"],
+            vec!["--enable-images", "--show-token"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+    }
     fn parse(args: &[&str]) -> Result<Config, &'static str> {
         Config::parse(args.iter().map(|s| s.to_string()))
+    }
+    #[test]
+    fn tailnet_is_dedicated_loopback_not_legacy_http_and_writes_remain_opt_in() {
+        let config = parse(&["--tailnet-backend"]).unwrap();
+        assert_eq!(config.bind, "127.0.0.1:8766".parse().unwrap());
+        assert!(!config.insecure_http && !config.allow_write);
+        assert!(config.tls_paths().unwrap().is_none());
+        assert!(
+            parse(&["--tailnet-backend", "--allow-clipboard-write"])
+                .unwrap()
+                .allow_write
+        );
+        for args in [
+            vec!["--tailnet-backend", "--lan", "192.168.1.7"],
+            vec!["--tailnet-backend", "--insecure-http"],
+            vec!["--tailnet-backend", "--allow-insecure-clipboard-write"],
+            vec!["--tailnet-backend", "--tls-cert", "a", "--tls-key", "b"],
+            vec!["--tailnet-backend", "--port", "8765"],
+            vec!["--tailnet-backend", "--show-token"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
     }
     #[test]
     fn defaults_to_loopback_and_requires_explicit_private_lan_ip() {

@@ -9,3 +9,9 @@
 *.key
 *.pfx
 *.p12
+
+# Local settings and credentials must never enter the repository.
+/settings.json
+/desktop.json
+/updates.json
+/update-notifications.json

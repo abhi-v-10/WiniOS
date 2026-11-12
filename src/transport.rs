@@ -9,6 +9,7 @@ use std::{
     pin::Pin,
     time::Duration,
 };
+use std::{io::Read, net::Ipv4Addr};
 use tokio::sync::oneshot;
 
 pub fn install_crypto_provider() {
@@ -22,6 +23,67 @@ pub async fn load_identity(cert: &Path, key: &Path) -> io::Result<RustlsConfig> 
         io::ErrorKind::InvalidInput,
         "TLS identity could not be loaded (missing/invalid PEM, unsupported or mismatched key). Check certificate setup; HTTP fallback is disabled.",
     ))
+}
+
+/// Startup guard, not a replacement for clients' normal trust validation.
+/// Never silently select another IP or regenerate an identity.
+pub fn validate_server_ip(path: &Path, ip: Ipv4Addr) -> io::Result<()> {
+    use x509_parser::{
+        extensions::GeneralName,
+        prelude::{FromDer, X509Certificate},
+    };
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TLS certificate is invalid, expired/not-yet-valid, or lacks serverAuth/IP SAN for the configured address. Correct settings or safely reprovision; no rebinding or downgrade occurred.",
+        )
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "TLS certificate is missing or inaccessible.",
+            )
+        })?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes).map_err(|_| invalid())?;
+    let (_, certificate) = X509Certificate::from_der(&pem.contents).map_err(|_| invalid())?;
+    if !certificate.validity().is_valid() {
+        return Err(invalid());
+    }
+    if certificate
+        .basic_constraints()
+        .map_err(|_| invalid())?
+        .is_some_and(|extension| extension.value.ca)
+    {
+        return Err(invalid());
+    }
+    if !certificate
+        .extended_key_usage()
+        .map_err(|_| invalid())?
+        .is_some_and(|extension| extension.value.server_auth)
+    {
+        return Err(invalid());
+    }
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if !san
+        .value
+        .general_names
+        .iter()
+        .any(|name| matches!(name, GeneralName::IPAddress(bytes) if *bytes == ip.octets()))
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 pub async fn serve(

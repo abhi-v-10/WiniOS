@@ -54,6 +54,7 @@ pub struct SessionId {
 pub enum Origin {
     WindowsClipboard,
     Iphone,
+    Setup,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +76,7 @@ pub enum UnavailableReason {
     ChangedDuringRead,
     WatcherStopped,
     WriteFailed,
+    PrivateContent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +89,7 @@ pub struct ClipboardText {
 pub enum ClipboardState {
     Empty,
     Available(ClipboardText),
+    Image(Arc<crate::image::ClipboardImage>),
     Unavailable(UnavailableReason),
 }
 
@@ -106,15 +109,21 @@ struct Inner {
     snapshot: ClipboardSnapshot,
     // Comparison only: never returned by snapshot() or used as readable fallback.
     last_successful_text: Option<String>,
+    last_successful_image: Option<Arc<crate::image::ClipboardImage>>,
 }
 
 /// Owned point-in-time snapshots; callers never receive a lock or mutation guard.
 #[derive(Clone)]
 pub struct ClipboardStore {
     inner: Arc<RwLock<Inner>>,
+    revision: tokio::sync::watch::Sender<u64>,
+    images: crate::image::Options,
+    pub(crate) image_uploads: Arc<tokio::sync::Semaphore>,
+    pub(crate) image_downloads: Arc<tokio::sync::Semaphore>,
 }
 
 /// A store-issued token. Superseded tokens cannot publish or invalidate state.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Observation {
     operation_id: OperationId,
     sequence: Option<u32>,
@@ -129,6 +138,7 @@ impl Observation {
 pub enum ReadValue {
     Empty,
     Text(String),
+    Image(Arc<crate::image::ClipboardImage>),
     Unavailable(UnavailableReason),
 }
 
@@ -144,8 +154,13 @@ impl Default for ClipboardStore {
     fn default() -> Self {
         let now = SystemTime::now();
         Self {
+            images: crate::image::Options::default(),
+            revision: tokio::sync::watch::channel(0).0,
+            image_uploads: Arc::new(tokio::sync::Semaphore::new(1)),
+            image_downloads: Arc::new(tokio::sync::Semaphore::new(2)),
             inner: Arc::new(RwLock::new(Inner {
                 last_successful_text: None,
+                last_successful_image: None,
                 snapshot: ClipboardSnapshot {
                     state: ClipboardState::Unavailable(UnavailableReason::NotRead),
                     updated_at: now,
@@ -166,6 +181,15 @@ impl Default for ClipboardStore {
 }
 
 impl ClipboardStore {
+    pub fn with_images(options: crate::image::Options) -> Self {
+        Self {
+            images: options.validate().unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+    pub fn image_options(&self) -> crate::image::Options {
+        self.images
+    }
     pub fn snapshot(&self) -> ClipboardSnapshot {
         self.inner
             .read()
@@ -183,6 +207,22 @@ impl ClipboardStore {
             .version
             == version
     }
+    /// A tiny revision signal does not keep clipboard contents alive in a body.
+    pub(crate) fn revisions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+    pub(crate) async fn changed_since(&self, version: u64) {
+        let mut receiver = self.revisions();
+        loop {
+            let current = *receiver.borrow_and_update();
+            if current != version {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 
     /// Invalidate before accessing Win32, including the initial startup read.
     /// Sequence numbers are equality-only tokens: never numerically ordered.
@@ -193,13 +233,19 @@ impl ClipboardStore {
     pub fn begin_remote_observation(&self, sequence: Option<u32>) -> Observation {
         self.begin_with_origin(sequence, Origin::Iphone)
     }
+    pub fn begin_setup_observation(&self, sequence: Option<u32>) -> Observation {
+        self.begin_with_origin(sequence, Origin::Setup)
+    }
 
     pub fn is_remote_sequence(&self, sequence: Option<u32>) -> bool {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         sequence.is_some()
             && inner.snapshot.sequence == sequence
             && inner.snapshot.origin == Origin::Iphone
-            && matches!(inner.snapshot.state, ClipboardState::Available(_))
+            && matches!(
+                inner.snapshot.state,
+                ClipboardState::Available(_) | ClipboardState::Image(_)
+            )
     }
 
     fn begin_with_origin(&self, sequence: Option<u32>, origin: Origin) -> Observation {
@@ -211,6 +257,7 @@ impl ClipboardStore {
         snapshot.updated_at = SystemTime::now();
         snapshot.sequence = sequence;
         snapshot.origin = origin;
+        self.revision.send_replace(snapshot.version);
         Observation {
             operation_id: snapshot.operation_id,
             sequence,
@@ -228,6 +275,7 @@ impl ClipboardStore {
         let Inner {
             snapshot,
             last_successful_text,
+            last_successful_image,
         } = &mut *inner;
         if snapshot.operation_id != observation.operation_id {
             return Ok(Update::Superseded);
@@ -236,6 +284,15 @@ impl ClipboardStore {
         let state = match value {
             ReadValue::Empty => ClipboardState::Empty,
             ReadValue::Unavailable(reason) => ClipboardState::Unavailable(reason),
+            ReadValue::Image(image) => {
+                if !self.images.enabled {
+                    ClipboardState::Unavailable(UnavailableReason::UnsupportedFormat)
+                } else if image.len() > self.images.max_bytes() {
+                    ClipboardState::Unavailable(UnavailableReason::Oversized)
+                } else {
+                    ClipboardState::Image(image)
+                }
+            }
             ReadValue::Text(text) => {
                 if text.len() > MAX_TEXT_BYTES || text.encode_utf16().count() > MAX_TEXT_BYTES / 2 {
                     validation_error = Some(TextError::TooLarge);
@@ -250,6 +307,7 @@ impl ClipboardStore {
         };
         let duplicate = match &state {
             ClipboardState::Available(text) => last_successful_text.as_ref() == Some(&text.text),
+            ClipboardState::Image(image) => last_successful_image.as_ref() == Some(image),
             _ => snapshot.state == state,
         };
         match &state {
@@ -257,11 +315,21 @@ impl ClipboardStore {
                 // Remote writes must not become outgoing local changes, nor
                 // suppress a later deliberate local copy of the same text.
                 *last_successful_text = None;
+                *last_successful_image = None;
             }
             ClipboardState::Available(text) => {
+                *last_successful_image = None;
                 if !duplicate {
                     *last_successful_text = Some(text.text.clone());
                 }
+            }
+            ClipboardState::Image(_) if snapshot.origin == Origin::Iphone => {
+                *last_successful_text = None;
+                *last_successful_image = None;
+            }
+            ClipboardState::Image(image) => {
+                *last_successful_text = None;
+                *last_successful_image = Some(image.clone());
             }
             // Uncertainty invalidates readable state, but says nothing about
             // whether the clipboard's text actually changed. Keep comparison
@@ -274,17 +342,24 @@ impl ClipboardStore {
             ) => {}
             // Settled non-text/rejected outcomes (and exhausted retries) break
             // the run of successful text copies and release the private text.
-            _ => *last_successful_text = None,
+            _ => {
+                *last_successful_text = None;
+                *last_successful_image = None;
+            }
         }
         snapshot.state = state;
         snapshot.updated_at = SystemTime::now();
         snapshot.version += 1;
+        self.revision.send_replace(snapshot.version);
         if let Some(error) = validation_error {
             return Err(error);
         }
         Ok(
             if snapshot.origin == Origin::Iphone
-                && matches!(snapshot.state, ClipboardState::Available(_))
+                && matches!(
+                    snapshot.state,
+                    ClipboardState::Available(_) | ClipboardState::Image(_)
+                )
             {
                 Update::Remote
             } else if duplicate {

@@ -30,6 +30,224 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[tokio::test]
+async fn validated_https_smart_receive_metadata_and_changed_clipboard_binding() {
+    async fn get(
+        address: SocketAddr,
+        root: CertificateDer<'static>,
+        path: &str,
+        auth: bool,
+        version: Option<&str>,
+    ) -> (u16, Vec<u8>) {
+        let mut stream = connect(address, Some(root), "127.0.0.1").await.unwrap();
+        let auth = if auth {
+            format!("Authorization: Bearer {TOKEN}\r\n")
+        } else {
+            String::new()
+        };
+        let version = version.map_or(String::new(), |v| {
+            format!("X-WiniOS-Clipboard-Version: {v}\r\n")
+        });
+        stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: {address}\r\n{auth}{version}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+            .await
+            .unwrap();
+        let split = bytes.windows(4).position(|p| p == b"\r\n\r\n").unwrap() + 4;
+        let head = std::str::from_utf8(&bytes[..split]).unwrap();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("cache-control: no-store")
+        );
+        (
+            head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            bytes[split..].to_vec(),
+        )
+    }
+    let store = ClipboardStore::with_images(crate::image::Options {
+        enabled: true,
+        ..Default::default()
+    });
+    let publish = |value| {
+        let mut observation = store.begin_observation(Some(7));
+        store.complete(&mut observation, value).unwrap();
+    };
+    publish(ReadValue::Text("smart receive TLS 😀".into()));
+    let app = http::router(ApiState {
+        store: store.clone(),
+        token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
+        sequence: || Some(7),
+        writes: None,
+    });
+    let (tls, root) = identity(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let server = tokio::spawn(transport::serve(listener, app, Some(tls), stop_rx));
+    assert_eq!(
+        get(address, root.clone(), "/v1/clipboard/type", false, None)
+            .await
+            .0,
+        401
+    );
+    let (status, body) = get(address, root.clone(), "/v1/clipboard/type", true, None).await;
+    assert_eq!(status, 200);
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["kind"], "text");
+    let version = meta["version"].as_str().unwrap();
+    let (status, body) = get(address, root.clone(), "/v1/clipboard", true, Some(version)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "smart receive TLS 😀".as_bytes());
+    let image = crate::image::encode_png(
+        &crate::image::fixture(),
+        crate::image::Options::default(),
+        &crate::image::Budget::new(),
+    )
+    .unwrap();
+    publish(ReadValue::Image(image.clone()));
+    let (status, body) = get(address, root.clone(), "/v1/clipboard", true, Some(version)).await;
+    assert_eq!(status, 412);
+    assert!(body.is_empty());
+    let (_, body) = get(address, root.clone(), "/v1/clipboard/type", true, None).await;
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["kind"], "image");
+    let (status, body) = get(
+        address,
+        root,
+        "/v1/clipboard/image",
+        true,
+        meta["version"].as_str(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, &image.png()[..]);
+    stop(stop_tx, server).await;
+}
+
+#[tokio::test]
+async fn validated_https_binary_png_get_post_and_authentication() {
+    let options = crate::image::Options {
+        enabled: true,
+        ..Default::default()
+    };
+    let image = crate::image::encode_png(
+        &crate::image::fixture(),
+        options,
+        &crate::image::Budget::new(),
+    )
+    .unwrap();
+    let store = ClipboardStore::with_images(options);
+    let mut observation = store.begin_observation(Some(7));
+    store
+        .complete(&mut observation, ReadValue::Image(image.clone()))
+        .unwrap();
+    let (sender, mut receiver) = mpsc::channel(4);
+    tokio::spawn(async move {
+        while let Some(command) = receiver.recv().await {
+            let command: crate::writes::WriteCommand = command;
+            assert!(command.image.is_some());
+            let _ = command.ack.send(Ok(WriteReceipt {
+                operation: 77,
+                sequence: Some(7),
+            }));
+        }
+    });
+    let app = http::router(ApiState {
+        store,
+        token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
+        sequence: || Some(7),
+        writes: Some(WriteClient::new(sender, || true)),
+    });
+    let (tls, root) = identity(false);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let server = tokio::spawn(transport::serve(listener, app, Some(tls), stop_rx));
+    for (method, auth, expected) in [
+        ("GET", false, 401),
+        ("POST", false, 401),
+        ("GET", true, 200),
+        ("POST", true, 200),
+    ] {
+        let mut stream = connect(address, Some(root.clone()), "127.0.0.1")
+            .await
+            .unwrap();
+        let auth = if auth {
+            format!("Authorization: Bearer {TOKEN}\r\n")
+        } else {
+            String::new()
+        };
+        let bytes = if method == "POST" {
+            image.png()
+        } else {
+            axum::body::Bytes::new()
+        };
+        let headers = format!(
+            "{method} /v1/clipboard/image HTTP/1.1\r\nHost: {address}\r\n{auth}Content-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .unwrap();
+        let split = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let head = std::str::from_utf8(&response[..split]).unwrap();
+        assert!(head.starts_with(&format!("HTTP/1.1 {expected}")));
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("cache-control: no-store")
+        );
+        if method == "GET" && expected == 200 {
+            assert_eq!(&response[split..], &image.png()[..]);
+        }
+    }
+    stop(stop_tx, server).await;
+}
+
+#[test]
+fn startup_identity_guard_rejects_wrong_ip_expiry_and_cn_only_certificates() {
+    fn check(mut params: CertificateParams, expected: bool) {
+        params.not_before = date_time_ymd(2020, 1, 1);
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "winios-public-cert-{}-{}.pem",
+            std::process::id(),
+            certificate.der().len()
+        ));
+        std::fs::write(&path, certificate.pem()).unwrap();
+        let result = transport::validate_server_ip(&path, "192.168.1.7".parse().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.is_ok(), expected);
+    }
+    let mut valid = CertificateParams::new(vec!["192.168.1.7".into()]).unwrap();
+    valid.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    valid.not_after = date_time_ymd(2040, 1, 1);
+    check(valid.clone(), true);
+    let mut wrong_ip = valid.clone();
+    wrong_ip.subject_alt_names = CertificateParams::new(vec!["192.168.1.8".into()])
+        .unwrap()
+        .subject_alt_names;
+    check(wrong_ip, false);
+    let mut expired = valid.clone();
+    expired.not_after = date_time_ymd(2021, 1, 1);
+    check(expired, false);
+    let mut cn_only = valid;
+    cn_only.subject_alt_names.clear();
+    cn_only
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "192.168.1.7");
+    check(cn_only, false);
+}
+
 fn identity(expired: bool) -> (RustlsConfig, CertificateDer<'static>) {
     transport::install_crypto_provider();
     let ca_key = KeyPair::generate().unwrap();
@@ -222,6 +440,46 @@ async fn tls_preserves_exact_tcp_peer_in_connect_info_not_forwarded_headers() {
     let response = exchange(tls, format!("GET /test-peer HTTP/1.1\r\nHost: {address}\r\nX-Forwarded-For: 8.8.8.8\r\nConnection: close\r\n\r\n")).await;
     assert!(response.ends_with(&actual_peer.to_string()));
     assert_eq!(actual_peer.ip().to_string(), "127.0.0.2");
+    stop(shutdown, task).await;
+}
+
+#[tokio::test]
+async fn real_loopback_backend_enforces_tcp_peer_even_with_spoofed_proxy_headers() {
+    let gate = crate::tailnet::Gate::default();
+    gate.set_for_test(true);
+    let app = http::tailnet_router(
+        ApiState {
+            store: ClipboardStore::default(),
+            token: Arc::new(BearerToken::from_hex(TOKEN.as_bytes()).unwrap()),
+            sequence: || Some(7),
+            writes: None,
+        },
+        gate,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, stopped) = oneshot::channel();
+    let task = tokio::spawn(transport::serve(listener, app, None, stopped));
+    for (source, status) in [("127.0.0.1:0", "200"), ("127.0.0.2:0", "403")] {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(source.parse().unwrap()).unwrap();
+        let mut connection = socket.connect(address).await.unwrap();
+        connection.write_all(b"GET /v1/health HTTP/1.1\r\nHost: ignored.example\r\nX-Forwarded-For: 127.0.0.1\r\nTailscale-User-Login: injected@example.invalid\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            connection.read_to_end(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .starts_with(&format!("HTTP/1.1 {status}"))
+        );
+    }
     stop(shutdown, task).await;
 }
 

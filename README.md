@@ -1,3 +1,343 @@
+# WiniOS — private beta 0.1.3
+
+Mission 017 produces packaging-only beta revision `0.1.2-r1`; application binaries
+are unchanged. [Resolved and remaining blockers](docs/mission-017.md).
+
+Private-beta candidate **0.1.2** packages current onboarding with a clean,
+explicit documentation payload and privacy scan. See the [beta install/rollback
+guide and remaining blockers](docs/private-beta.md). Actual Smart Shortcut links
+remain pending; this is not a claim of complete beta acceptance.
+
+Mission 015 adds numbered native iPhone setup guidance and a safe connection test.
+Install the two standalone Smart Shortcuts using docs/mission-018.md.
+See [pairing instructions and validation](docs/mission-015.md).
+
+Mission 014 improves native first-run recovery and Smart Shortcut guidance while
+preserving configured installations. See [onboarding and validation](docs/mission-014.md).
+
+Mission 012 packages the existing app in a versioned per-user installer without
+installing it automatically. See the [short install/upgrade/rollback guide](docs/release-0.1.1.md).
+
+Settings → About supports manual update checks and optional automatic checks
+against a trusted public GitHub repository. Automatic checks are off by default;
+WiniOS never downloads or installs updates. See [update notification setup and
+security](docs/mission-021.md).
+
+Mission 011 polish clarifies paused/offline/retry status, safe diagnostics and
+empty/412 recovery without API or settings changes. Deployed on 2026-11-10 by
+explicit request. See [changes, verification and rollback](docs/mission-011.md).
+
+Authenticated **GET `/v1/clipboard/type`** returns only `kind` and an opaque
+`version`. A single manually configured iPhone Receive Shortcut can branch to
+the existing text or image GET, passing **X-WiniOS-Clipboard-Version**. Changed
+observations fail closed instead of returning the wrong data. Existing helpers
+and requests without that header retain their contracts; published iCloud links
+are unchanged. See [exact Shortcut actions, API/race semantics and manual tests](docs/mission-010.md).
+
+## Stability and security hardening
+
+Mission 009 fixes admitted-upload and native-queue cancellation across Pause or
+detected Tailscale readiness loss, aborts stale/backpressured image bodies promptly,
+and avoids DIB allocation after cancellation. APIs/settings/Shortcuts and security
+identities are unchanged. About includes the requested developer/support footer.
+See [audit findings, actual tests/benchmarks, limitations and rollback](docs/mission-009.md).
+
+## Private image clipboard
+
+Bidirectional PNG transfers use separate authenticated **GET/POST
+`/v1/clipboard/image`** endpoints. Existing text endpoints and Shortcuts stay
+unchanged. Enable images explicitly in **Settings → Images**, select a 2/4/8 MiB
+cap and apply/restart; uploads also require the existing clipboard-write
+permission. Images default OFF. Native capture/conversion, version checks,
+acknowledged writes, Pause/Resume and private HTTPS boundaries apply to images too.
+No clipboard images are saved to disk by WiniOS. See [image API, limits, separate
+iPhone image Shortcuts, Windows validation and rollback](docs/mission-008.md).
+
+## Native Windows companion
+
+The tray now opens a native Fluent-style popup and a separate **Settings** window
+with General, Connection, Clipboard, Images, Privacy and About pages. The supplied app icon
+sets the midnight-blue, cyan and violet palette. Rounded native cards use opaque
+surfaces so text remains visible on the physical display; full-client glass is
+disabled for GDI controls. Live sharing,
+saved write permission and saved launch behavior are clearly separated; no token
+appears automatically. See [UI controls, persistence, tests and rollback](docs/mission-007-ui.md).
+The existing setup wizard remains available through iPhone Setup or `--setup`.
+
+Build **WiniOS-Setup.exe** with `.\scripts\Build-Installer.ps1` (Inno Setup 7).
+The native dark installer uses `%LOCALAPPDATA%\Programs\WiniOS`, requests no admin,
+adds Start Menu/Installed Apps integration and gracefully stops the agent for
+upgrades. Existing data, credentials, TLS, Serve and startup choice are preserved.
+Uninstall removes packaged files/shortcut/startup but keeps personal data and warns
+about user-managed Serve. See [build/release instructions, actual test results,
+security limits and rollback](docs/mission-007.md). Prototype builds are unsigned;
+publisher signing and clean-user interactive checks remain release requirements.
+
+The native wizard now includes **iPhone Setup** with the supplied Send/Receive
+template links, **Copy HTTPS Endpoint**, and an explicitly confirmed **Copy Bearer
+Token** action. Setup copies are private and excluded from WiniOS GET and Windows
+clipboard history/sync; other local apps can still read the clipboard. Review both
+templates and their Import Questions before entering credentials: their contents
+are not assumed credential-free. See [installation, manual audit, testing and
+rollback](docs/mission-006b.md). No pairing or automatic Tailscale changes.
+
+Fresh desktop installs now open a dark native **Settings / Setup** wizard for
+Tailscale checks, private HTTPS Serve verification, explicit clipboard-write
+consent and a connection test. Existing configured installations skip it; reopening
+from the tray is a protected read-only review. No automatic network provisioning,
+pairing or credential/certificate changes. See [setup behavior, security boundaries,
+manual tests and rollback](docs/mission-006a.md). Existing 005C tray/startup features
+below are preserved.
+
+The desktop app now has a dark, compact native popup, an embedded WiniOS icon,
+a proper per-user Start Menu shortcut, and an explicit **Start with Windows**
+checkbox. Startup defaults OFF and changes only when selected. Windows retains
+menu keyboard behavior, with a standard-menu fallback for High Contrast or
+rendering failure. See [Mission 005C setup, tests and rollback](docs/mission-005c.md).
+Saved settings, credentials, certificates and Tailscale configuration are preserved.
+
+The native tray menu now supports **Status**, **Pause/Resume Clipboard Sharing**,
+**Retry Connection**, and **Quit WiniOS**. Pause blocks authenticated clipboard
+GET/POST with 503 while unauthorized requests remain 401. It does not stop
+Tailscale or alter Serve, certificates, permissions or write opt-in. See the
+[tray menu fix and manual checks](docs/tray-menu-fix.md).
+
+**Roaming adapter:** see [portable connectivity setup, security boundaries,
+tests and rollback](docs/portable-connectivity.md). Tailscale Serve provides the
+external HTTPS identity and forwards only to a dedicated loopback backend.
+WiniOS never changes Serve, Funnel, firewall or network settings automatically.
+The original direct-LAN HTTPS mode below remains available, with its existing
+certificate and explicit IP binding. Startup is now an optional Mission 005C feature.
+
+Mission 005B is installed and user-verified over the new tailnet HTTPS URL: Safari
+loads without a certificate warning and both Shortcuts transfer text successfully.
+The Mission 005C baseline had **69 passing tests**; Mission 006B now has **80**,
+plus two explicitly run native/live probes. The real Tailscale HTTPS/native clipboard
+integration passes. See [actual results, changed files and remaining
+roaming tests](docs/mission-005b-validation.md). The Windows configuration now uses
+the explicit loopback backend; the approved Serve route is user-managed and
+persists after Quit. The direct-LAN setup below is retained for optional rollback.
+
+The standalone desktop application is **winios.exe**. It uses direct Win32
+notification-area APIs and a native message loop, with no web engine, frontend,
+Electron, Tauri or browser. The existing **winios-agent.exe** remains a console CLI.
+Both use the same library, HTTPS endpoints, credential, clipboard state and native
+clipboard worker. Mission 005A creates **no autostart entry** and changes no TLS
+identity, trust, network adapter or firewall configuration.
+
+## Desktop setup: use the existing identity
+
+Your already trusted `%LOCALAPPDATA%\WiniOS\tls` identity is reused. Do **not**
+regenerate/rotate it just to install tray mode. Existing iPhone URLs, tokens and
+Shortcuts do not change. Stop any older WiniOS process before building or replacing
+its binary; only one console/tray service may run per interactive Windows session.
+
+```powershell
+cd C:\WiniOS
+cargo build --release
+.\scripts\Test-DesktopBinary.ps1
+```
+
+Outputs:
+
+- `target\release\winios.exe`: Windows GUI-subsystem executable; double-click it
+  for tray mode with no console. The release PE-header test checks subsystem 2.
+- `target\release\winios-agent.exe`: existing Windows console-subsystem CLI
+  (subsystem 3), preserved for debugging and native/API tests.
+
+Copy `winios.exe` to a stable per-user folder such as
+`%LOCALAPPDATA%\Programs\WiniOS\winios.exe`. No installer, admin privilege or Windows
+Service is needed for normal operation. The GUI binary is standalone; it does not
+need the source tree or a frontend asset folder. The CLI binary is optional but
+useful for diagnostics. Keep certificate/key files in their protected existing
+location, not next to downloaded/shared binaries. Moving from the debug CLI to the
+release GUI changes the executable path: if necessary, review a Private-profile,
+LocalSubnet firewall rule for this **new program path** yourself. No Public rule
+or automatic firewall exception is created.
+
+For a fresh **Tailscale** installation, launch the GUI without creating settings
+and follow its wizard. Existing settings are preserved automatically. The manual
+**direct-LAN HTTPS** alternative below remains supported; do not overwrite an
+existing `%LOCALAPPDATA%\WiniOS\settings.json`:
+
+```powershell
+$settingsDir = Join-Path $env:LOCALAPPDATA 'WiniOS'
+New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
+$settingsPath = Join-Path $settingsDir 'settings.json'
+if (-not (Test-Path -LiteralPath $settingsPath)) {
+    Copy-Item -LiteralPath .\settings.json.example -Destination $settingsPath
+}
+notepad $settingsPath
+```
+
+Minimal UTF-8 JSON (the example defaults writes to **false**):
+
+```json
+{
+  "lan_ip": "192.168.1.7",
+  "port": 8765,
+  "allow_clipboard_write": false
+}
+```
+
+Set `allow_clipboard_write` to `true` yourself to enable the working POST Shortcut.
+This permission is persisted safely as a boolean; there is no insecure-write flag
+in tray mode. The configured IP must be assigned to your PC and match the existing
+certificate's **IP SAN**. No wildcard/public/automatic bind or plaintext option is
+accepted. Optional `tls_cert` and `tls_key` must be supplied together as absolute
+local file paths (escape backslashes in JSON). Omit both to use the existing default
+identity. Do not put a token, password, private key, CA signing key or other secrets
+in settings. Unknown fields, non-private IPs, UNC/device/relative paths and files
+larger than 16 KiB are rejected. Local paths are resolved and checked before use.
+
+Launch by double-clicking the installed `winios.exe` in Explorer. No terminal is
+needed. An explicit alternative config path is supported for controlled testing:
+`winios.exe --config C:\absolute\settings.json`. Running settings are not silently
+reloaded: Quit and relaunch or choose **Retry Connection** after changing them.
+Retry reads settings/certificate files again after the old worker has stopped.
+
+## Tray behavior and graceful Quit
+
+Right-click the WiniOS W icon (possibly under the notification-area overflow arrow):
+
+- **Status**: opens a metadata-only dialog with connection state and HTTPS endpoint.
+  The menu and tooltip also show when clipboard sharing is Paused.
+- **Pause/Resume Clipboard Sharing**: blocks authenticated clipboard GET/POST with
+  503 while keeping unauthorized requests at 401. It leaves Tailscale connected.
+- **HTTPS endpoint**: address/port only, never a credential.
+- **Start with Windows**: actual per-user WiniOS Run registration, default OFF.
+  Select the checkbox to enable/disable it. Windows Startup Apps policy remains
+  separate and is never overridden. Other applications' startup entries are untouched.
+- **Retry Connection**: gracefully stops the existing worker, rereads settings,
+  and starts one replacement after cleanup. Pause survives Retry. It cannot start
+  overlapping servers or silently select another network IP.
+- **Quit WiniOS**: requests orderly application shutdown, not process termination.
+
+Quit signals the background service, stops accepting API work, prevents pending
+native writes from starting, removes the clipboard listener/window, joins the
+worker, and then removes the tray icon and releases the singleton. The UI continues
+processing messages while shutdown proceeds. Already accepted native writes cannot
+be undone. The normal HTTP drain remains bounded to five seconds. A Windows
+clipboard provider stuck inside a synchronous Win32 call may delay native cleanup;
+there is no unsafe thread termination to fake an immediate Quit.
+
+For rollback/automation if the icon is hidden, `winios.exe --quit` posts the same
+local graceful close request to the tray app. It starts no server/watcher. Wait for
+process exit before replacing the executable. It does not stop the separate console
+agent; that mode still uses Ctrl+C/Ctrl+Break.
+
+The tray loop owns only icon/menu/window resources. HTTPS runs on a background
+Tokio thread, and the existing clipboard message loop remains on its dedicated OS
+thread. No network or clipboard retry waits run on the tray UI thread. State changes
+wake the UI via native messages. Windows address-removal notifications stop the
+service if the configured IP disappears; no address polling or automatic rebind is
+used. Other connectivity faults (firewall, AP isolation, interface down while its IP
+remains assigned) still need connectivity checks; Running means the service bound,
+not that every phone can reach it. Explorer-restart notifications re-add the icon.
+
+## Errors, diagnostics and recovery
+
+Missing settings, missing TLS files, invalid/expired certificates, IP-SAN mismatch,
+bind conflicts and unavailable addresses fail visibly with an error dialog/status.
+A mismatched certificate is never regenerated or trusted automatically, and no
+HTTPS failure downgrades to HTTP. Network unavailable does not select a replacement
+IP. Restore the original assigned IP or safely reprovision identity as documented
+in Mission 004A, then fix settings and Retry. If an IP is removed while running,
+restart requires explicit Retry after the failure has settled.
+
+The GUI has no disk log and disables stdout/stderr diagnostics. No clipboard text,
+request bodies, bearer tokens, passwords or private keys are logged. For metadata-only
+console diagnostics after quitting tray mode:
+
+```powershell
+.\target\release\winios-agent.exe --lan 192.168.1.7 --port 8765 --allow-clipboard-write
+```
+
+Alternatively, `winios.exe --console <CLI options>` explicitly attaches/allocates a
+console and runs console mode instead of a tray. This is the only GUI-executable
+path that calls console allocation APIs. The normal no-argument launch never does.
+The existing explicit token-export command stays in console mode, separate from
+normal logs; do not redirect its secret output. Use `winios-agent.exe --help` for
+CLI options. Legacy insecure development mode is not available through tray settings.
+
+## Mission 005A validation and remaining manual checks
+
+Required checks:
+
+```powershell
+cargo fmt --check
+cargo check
+cargo test
+cargo build --release
+.\scripts\Test-DesktopBinary.ps1
+```
+
+The Mission 005A automated suite had **46 passing tests** (now 62 with the tray menu fix), including lifecycle/error-retry models,
+sticky early shutdown, singleton duplicate rejection/release, safe persisted config,
+certificate IP/expiry/CN-only rejection, network notification registration/removal
+policy, API authentication/limits/continuity, TLS negatives, and queued-write shutdown.
+The release PE test confirms GUI/no-automatic-console and preserved console binaries.
+
+The existing HTTPS native integration script passed against the release GUI-hosted
+service, using the existing certificate and a temporary explicit-write config:
+
+```powershell
+.\scripts\Test-ClipboardPost.ps1 -BaseUri https://192.168.1.7:8765 -CaCertificate (Join-Path $env:LOCALAPPDATA 'WiniOS\tls\winios-ca.cer')
+```
+
+It verified exact Unicode/LF/CRLF writes, GET readback, authentication, repeated
+operations, temporary contention recovery, exhaustion without a false success, and
+subsequent local-copy recovery. The independent graceful `--quit` test completed.
+A four-second idle sample of the installed app measured **0 ms CPU**
+and **17.3 MiB working set**; this is one observation, not a universal performance
+guarantee. The native loops are event-driven and contain no idle polling timer.
+
+**User-verified on actual devices:** the installed tray app is visible and both
+Windows → iPhone and iPhone → Windows copy/paste work. It is installed under
+`%LOCALAPPDATA%\Programs\WiniOS`, using `%LOCALAPPDATA%\WiniOS\settings.json`
+originally with HTTPS at `192.168.1.7:8765` and authenticated writes enabled. Mission
+005B now selects the tailnet backend as documented above. The existing
+certificate and Credential Manager token were reused without rotation or trust
+changes. The GUI app was left running after setup; no autostart was registered.
+
+Computer Use was stopped by the user's physical Escape key, so no claim is made
+that the agent interactively exercised tray-menu commands. The independent
+graceful `--quit` path was tested. Explorer restart, actual adapter/IP removal,
+startup error dialogs and interactive Retry/Quit remain additional manual checks:
+
+1. Stop the old console agent. Put the release GUI in its stable folder, create
+   settings using the existing LAN IP/cert, and opt into writes if desired.
+2. Double-click the GUI in Explorer. Verify no terminal appears, one W icon appears
+   (check overflow), and its menu reports Running, the correct HTTPS endpoint and
+   display-only startup status. Launch it again: no second watcher/server should
+   start; the second launch should report that WiniOS is already running.
+3. Use both existing iPhone Shortcuts and paste into Notes/Notepad. Run the HTTPS
+   integration script using disposable text. The token/URLs/JSON remain unchanged.
+4. Quit from the tray while idle and during queued requests. Verify pending writes
+   fail or finish safely, the endpoint stops responding, the icon disappears and
+   the process exits. Relaunch to verify mutex release and no orphan listener.
+5. While stopped, use a separate test settings file with a wrong IP, invalid key
+   path or unavailable port. Verify Error/Network unavailable and no API listener.
+   Correct it and use Retry. Never change trust or accept a bad certificate as a fix.
+6. If convenient, test actual network/IP removal: expect service stop and Network
+   unavailable with no rebind. Restore the same address and Retry; a permanent new
+   address requires a safely matching identity. Do not disrupt active work merely
+   for this test. Explorer restart/re-add behavior is another optional manual check.
+7. Observe Task Manager at idle. No constant CPU activity should be caused by the
+   tray or clipboard loops; repeat with the icon tooltip/menu open as well.
+
+To roll back, Quit the GUI (or use its graceful `--quit` control), wait for exit,
+and launch the existing console CLI with the same HTTPS arguments. Remove only the
+copied desktop executable/temporary test settings if desired. Leave certificates,
+Credential Manager and iPhone trust intact for the console agent. No startup entry,
+scheduled task, Windows Service or firewall rule needs to be undone by Mission 005A.
+
+## Existing Mission 004A HTTPS/certificate reference
+
+The following sections retain the certificate lifecycle and API reference. Normal
+Mission 005A installation reuses the existing identity; do not rerun certificate
+provisioning as a tray-install step.
+
 # WiniOS — Mission 004A: HTTPS on a private LAN
 
 Stage A adds Rustls HTTPS around the physically verified Win32 clipboard core.
@@ -141,22 +481,9 @@ Never send `ca.key.encrypted.pem`, `server.key.pem`, their passwords, a private-
 PEM, or a PFX/PKCS#12 to iPhone. The public `.cer` contains no private key. No PKCS#12
 export/import is used by this workflow.
 
-## 4. Existing Shortcuts: change URLs only
+## 4. iPhone Shortcuts
 
-After root installation and trust, change the URL in both existing Shortcuts to
-**https://192.168.1.7:8765/v1/clipboard**. Keep the same bearer header, actions,
-JSON schema and result handling. No TLS bypass/custom validation action is needed.
-
-- GET: **Get Contents of URL → GET**, header `Authorization: Bearer <token>`;
-  if the result has a value, **Copy to Clipboard**. Empty/error responses must not
-  copy an old action result. Valid zero-length text still yields 200 with no bytes.
-- POST: **Get Clipboard → Get Contents of URL → POST**, same Authorization header,
-  **Request Body: JSON**, Text field `text` using the Get Clipboard magic variable.
-  Let Shortcuts encode the JSON. Only show success when response dictionary `status`
-  equals `ok`. HTTP errors/transport failures must not show success.
-- Allow iOS local-network permission when prompted. No additional iPhone app is
-  necessary. The bearer token remains the initial application authentication, not
-  device pairing or mutual TLS. Do not share Shortcuts containing that secret.
+Install only the two standalone Smart Shortcuts using [Mission 018](docs/mission-018.md).
 
 ## API behavior remains unchanged
 
@@ -320,6 +647,7 @@ for that mode; its normal path requires HTTPS with full validation.
 | --- | --- | --- |
 | `Empty` | Clipboard opened successfully and has zero formats | None |
 | `Available` | Valid, bounded `CF_UNICODETEXT`, including a zero-length string | Current observed text |
+| `Image` | Images explicitly enabled and a validated, bounded bitmap/PNG observed | Current PNG through the separate image API; never returned by the text endpoint |
 | `Unavailable(reason)` | Not read yet, pending, failed, unsupported, malformed, oversized, unknown sequence, changed during read, or retries exhausted | None |
 
 A pending read and the first temporary access failure invalidate readable text
@@ -328,7 +656,9 @@ The private comparison baseline can remain in memory during uncertainty, includi
 while snapshots are `Unavailable`; it is not part of the snapshot or any future
 network response. Retry exhaustion discards it as a conservative terminal policy.
 An empty Unicode string is `Available` with zero characters; a clipboard with no
-formats is `Empty`. Unsupported image/file-only clipboards are `Unavailable`.
+formats is `Empty`. Image-only clipboards are `Unavailable` while images are
+disabled, or `Image` after successful enabled conversion. Unsupported formats
+(including file-only clipboards) remain `Unavailable`.
 
 Every snapshot includes `updated_at`, a monotonically increasing local `version`,
 the observed Windows `sequence` (or `None` for zero/unknown), `origin`, and an
@@ -432,8 +762,10 @@ part of Stage A.
    Temporary-unavailability logs are still allowed.
 3. Copy different text from VS Code, then copy `Mission 001` again. Expect one
    update for each change. Try Unicode text such as `A😀é` (3 characters).
-4. Copy an image from Paint or a file from Explorer. Expect
-   `Unavailable(UnsupportedFormat)` and no text in a fresh store snapshot.
+4. With images disabled, copy an image from Paint or a file from Explorer. Expect
+   `Unavailable(UnsupportedFormat)` and no text in a fresh store snapshot. With
+   images enabled, a supported image instead enters `Image`; the text API still
+   returns no stale text. See Mission 008 for the separate image endpoint.
    Clear the clipboard using a native helper's `OpenClipboard` → `EmptyClipboard`
    → `CloseClipboard`; expect `Empty`. Copy the earlier text again; expect a new
    update. A helper publishing a valid zero-length Unicode string should instead

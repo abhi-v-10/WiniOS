@@ -1,0 +1,38 @@
+WiniOS 0.1.3 — native Windows clipboard companion (local unsigned release)
+
+This installer runs for the current user without administrator privileges.
+It installs only the app, icon, documentation, Start Menu shortcut and uninstaller
+under %LOCALAPPDATA%\Programs\WiniOS. No Windows Service or web engine is installed.
+
+Any running tray app is asked to quit gracefully before files are replaced.
+Close console/debug agents with Ctrl+C yourself. A busy/unresponsive agent causes
+installation to stop; processes and threads are never forcibly terminated.
+
+Existing settings in %LOCALAPPDATA%\WiniOS, Windows Credential Manager token,
+TLS files, Tailscale Serve and startup preference are preserved. An existing
+recognized startup command is repaired to this installed path; an absent entry
+stays OFF. Windows Startup Apps disable/policy settings are never overridden.
+
+Uninstall removes packaged files, the WiniOS shortcut and its recognized startup
+registration. Personal settings, credentials and TLS files remain by default.
+There is intentionally no "delete all personal data" option in this installer.
+
+Tailscale Serve is user-managed and may remain after uninstall. Inspect its routes
+with "tailscale serve status" yourself. Only for the dedicated WiniOS HTTPS 443
+listener, with your approval, "tailscale serve --https=443 off" removes it. Do not
+reset or remove unrelated routes. The installer never runs these commands, changes
+firewall rules, installs trust or rotates certificates/credentials.
+
+The app may be launched from the final page. First-time users complete native
+Setup; configured users retain their working settings. Clipboard transfer requires
+authenticated HTTPS, appropriate permissions and an awake/connected Windows host.
+
+To roll back, quit WiniOS and run a saved trusted compatible full installer over
+the same directory. Do not delete settings/token/TLS or overwrite uninstaller
+data manually. A clean reinstall after uninstall defaults startup to OFF.
+See docs\private-beta.md in the installed folder for the short release guide.
+
+Internal prototype builds are unsigned. Verify source and release SHA-256 before
+running. Unsigned publisher identity is a release limitation, not a requirement
+to purchase signing services. Review signing and release risks before wider
+distribution; never bypass SmartScreen or other Windows security warnings.

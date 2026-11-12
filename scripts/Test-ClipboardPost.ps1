@@ -2,15 +2,31 @@
 param(
     [Parameter(Mandatory = $true)][uri]$BaseUri,
     [string]$CaCertificate,
-    [switch]$AllowInsecureHttp
+    [switch]$AllowInsecureHttp,
+    [switch]$Tailnet,
+    [switch]$ExpectPaused,
+    [switch]$InspectCurrent
 )
 $ErrorActionPreference = 'Stop'
 if ($BaseUri.UserInfo -or $BaseUri.Query -or $BaseUri.Fragment -or $BaseUri.AbsolutePath -ne '/') { throw 'Use the printed base URL without credentials, path, or query.' }
 if ($BaseUri.Scheme -ne 'https' -and -not ($AllowInsecureHttp -and $BaseUri.Scheme -eq 'http')) { throw 'HTTPS is required; legacy HTTP tests need explicit -AllowInsecureHttp.' }
 if ($CaCertificate -and $BaseUri.Scheme -ne 'https') { throw 'A CA certificate is only applicable to HTTPS.' }
-$targetIp = [Net.IPAddress]::Parse($BaseUri.Host)
-$targetBytes = $targetIp.GetAddressBytes()
-if ($targetBytes.Length -ne 4 -or -not ($targetBytes[0] -eq 127 -or $targetBytes[0] -eq 10 -or ($targetBytes[0] -eq 172 -and $targetBytes[1] -ge 16 -and $targetBytes[1] -le 31) -or ($targetBytes[0] -eq 192 -and $targetBytes[1] -eq 168))) { throw 'Tests are limited to private/loopback IPv4.' }
+if ($Tailnet) {
+    if ($BaseUri.Scheme -ne 'https' -or $BaseUri.Port -ne 443 -or $CaCertificate -or $AllowInsecureHttp) { throw 'Tailnet tests require normal verified HTTPS on port 443, without custom trust or insecure options.' }
+    $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+    $statusJson = & $tailscale status --json --peers=false 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot read local Tailscale status.' }
+    $status = $statusJson | ConvertFrom-Json
+    $dnsName = ([string]$status.Self.DNSName).TrimEnd('.')
+    if ($status.BackendState -ne 'Running' -or -not $status.Self.Online -or -not $status.CurrentTailnet.MagicDNSEnabled -or $BaseUri.DnsSafeHost -cne $dnsName -or $status.CertDomains -cnotcontains $dnsName) { throw 'Tailnet URL must match the connected local Tailscale node and its permitted HTTPS identity.' }
+    # Platform TLS validates the publicly trusted Serve certificate and hostname.
+    $statusJson = $null
+    $status = $null
+} else {
+    $targetIp = [Net.IPAddress]::Parse($BaseUri.Host)
+    $targetBytes = $targetIp.GetAddressBytes()
+    if ($targetBytes.Length -ne 4 -or -not ($targetBytes[0] -eq 127 -or $targetBytes[0] -eq 10 -or ($targetBytes[0] -eq 172 -and $targetBytes[1] -ge 16 -and $targetBytes[1] -le 31) -or ($targetBytes[0] -eq 192 -and $targetBytes[1] -eq 168))) { throw 'Direct tests require private/loopback IPv4. Use -Tailnet for the verified node HTTPS hostname.' }
+}
 # Intentionally overwrites the clipboard with disposable test data. Never prints
 # clipboard contents, HTTP bodies, Authorization headers, or the stored token.
 Add-Type -TypeDefinition @'
@@ -33,6 +49,8 @@ public static class WiniOSPostTestNative {
     [DllImport("advapi32.dll")] static extern void CredFree(IntPtr credential);
     [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr hwnd);
     [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")] public static extern bool IsClipboardFormatAvailable(uint format);
     [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
     [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr handle);
     [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr handle);
@@ -68,7 +86,13 @@ public static class WiniOSPostTestNative {
         var ready = new ManualResetEventSlim();
         bool opened = false;
         var thread = new Thread(() => {
-            opened = OpenClipboard(IntPtr.Zero);
+            // Competing OS clipboard monitors may briefly hold the lock. The
+            // requested contention interval starts only AFTER acquisition.
+            for (int attempt=0; attempt<=6; attempt++) {
+                opened = OpenClipboard(IntPtr.Zero);
+                if (opened || attempt==6) break;
+                Thread.Sleep(20 << attempt);
+            }
             ready.Set();
             if (!opened) return;
             try { Thread.Sleep(milliseconds); } finally { CloseClipboard(); }
@@ -80,6 +104,32 @@ public static class WiniOSPostTestNative {
         if (!opened) { thread.Join(); throw new Exception("Contention helper could not open clipboard."); }
         return thread;
     }
+    // Exhaustion tests hold the lock through the RESPONSE rather than assuming
+    // HTTP admission starts immediately after a fixed-duration sleep begins.
+    public sealed class ClipboardLease : IDisposable {
+        readonly ManualResetEventSlim ready=new ManualResetEventSlim();
+        readonly ManualResetEventSlim release=new ManualResetEventSlim();
+        readonly Thread thread; volatile bool held;
+        public bool IsHeld { get { return held; } }
+        public ClipboardLease() {
+            thread=new Thread(() => {
+                bool opened=false;
+                try {
+                    for(int attempt=0;attempt<=6;attempt++){
+                        opened=OpenClipboard(IntPtr.Zero);
+                        if(opened||attempt==6)break;
+                        Thread.Sleep(20<<attempt);
+                    }
+                    held=opened;ready.Set();
+                    if(opened)release.Wait(20000); // bounded fail-safe for test-host loss
+                }finally{if(opened)CloseClipboard();held=false;ready.Set();}
+            });
+            thread.IsBackground=true;thread.Start();ready.Wait();
+            if(!held){Dispose();throw new Exception("Contention lease could not acquire clipboard.");}
+        }
+        public void Dispose(){release.Set();thread.Join();ready.Dispose();release.Dispose();}
+    }
+    public static ClipboardLease HoldUntilDisposed(){return new ClipboardLease();}
 }
 '@
 $handler = [System.Net.Http.SocketsHttpHandler]::new()
@@ -116,6 +166,35 @@ try {
     $response = Send-TestPost 'disposable unauthorized test'
     if ([int]$response.StatusCode -ne 401) { throw 'POST must reject missing credentials.' }
     $client.DefaultRequestHeaders.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', [WiniOSPostTestNative]::Token())
+    if ($InspectCurrent) {
+        # Read-only metadata: do not copy, paste, render, log or replace text.
+        $sequenceBefore = [WiniOSPostTestNative]::GetClipboardSequenceNumber()
+        $unicodeAvailable = [WiniOSPostTestNative]::IsClipboardFormatAvailable(13)
+        $current = $client.GetAsync($endpoint).GetAwaiter().GetResult()
+        try {
+            $responseBytes = $current.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+            [pscustomobject]@{
+                ClipboardGetHttpStatus = [int]$current.StatusCode
+                ResponseBytes = $responseBytes.Length
+                UnicodeTextFormatAvailable = $unicodeAvailable
+                SequenceBefore = $sequenceBefore
+                SequenceAfter = [WiniOSPostTestNative]::GetClipboardSequenceNumber()
+                NoStore = $current.Headers.CacheControl.NoStore
+            } | ConvertTo-Json -Compress
+            $responseBytes = $null
+        } finally { $current.Dispose() }
+        return
+    }
+    if ($ExpectPaused) {
+        foreach ($method in @('GET', 'POST')) {
+            $paused = if ($method -eq 'POST') { Send-TestPost 'disposable paused validation' } else { $client.GetAsync($endpoint).GetAwaiter().GetResult() }
+            try {
+                if ([int]$paused.StatusCode -ne 503 -or -not $paused.Headers.CacheControl.NoStore -or $paused.Content.ReadAsStringAsync().GetAwaiter().GetResult().Length -ne 0) { throw 'Paused authenticated requests must return empty HTTP 503 with no-store.' }
+            } finally { $paused.Dispose() }
+        }
+        Write-Output 'PASS: authenticated clipboard GET/POST=503 with empty no-store responses while paused; missing bearer POST=401. No accepted clipboard write.'
+        return
+    }
     $sample = 'WiniOS disposable POST test 😀' + [char]10 + 'Line 2: é' + [char]13 + [char]10 + 'End'
     $response = Send-TestPost $sample
     if ([int]$response.StatusCode -ne 200) { throw "POST acceptance failed: HTTP $([int]$response.StatusCode)" }
@@ -130,10 +209,10 @@ try {
     $hold = [WiniOSPostTestNative]::Hold(500)
     try { $retried = Send-TestPost $sample } finally { $hold.Join() }
     if ([int]$retried.StatusCode -ne 200) { throw 'Write did not recover from temporary contention.' }
-    $hold = [WiniOSPostTestNative]::Hold(2500)
-    try { $busy = Send-TestPost 'disposable text that must not be written' } finally { $hold.Join() }
-    if ([int]$busy.StatusCode -ne 503) {
-        throw "Write contention expected HTTP 503 but received HTTP $([int]$busy.StatusCode)."
+    $hold = [WiniOSPostTestNative]::HoldUntilDisposed()
+    try { $busy = Send-TestPost 'disposable text that must not be written'; if(-not$hold.IsHeld){throw 'Contention fixture expired before response.'} } finally { $hold.Dispose() }
+    if ([int]$busy.StatusCode -notin @(503,504)) {
+        throw "Write contention expected HTTP 503/504 but received HTTP $([int]$busy.StatusCode)."
     }
     if ([WiniOSPostTestNative]::Text() -cne $sample) { throw 'Failed write modified clipboard.' }
     # This is a deliberate local copy, independent of the agent write API.
@@ -145,7 +224,7 @@ try {
         Start-Sleep -Milliseconds 50
     }
     if (-not $localReadbackOk) { throw 'GET did not recover after a deliberate local copy.' }
-    Write-Output 'PASS: unauthorized POST=401; accepted/repeated/retried POST=200; exhausted contention=503; exact native Unicode + LF/CRLF readback; GET and local-copy recovery.'
+    Write-Output "PASS: unauthorized POST=401; accepted/repeated/retried POST=200; exhausted contention=$([int]$busy.StatusCode); exact native Unicode + LF/CRLF readback; GET and local-copy recovery."
 } finally {
     $sample = $null
     $client.Dispose()

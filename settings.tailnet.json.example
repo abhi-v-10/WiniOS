@@ -1,0 +1,5 @@
+{
+  "mode": "tailnet-backend",
+  "port": 8766,
+  "allow_clipboard_write": false
+}
